@@ -168,13 +168,22 @@ def _is_symlink_or_reparse(entry: "os.DirEntry[str]") -> bool:
     return False
 
 
+def _is_symlink_file(entry: "os.DirEntry[str]") -> bool:
+    try:
+        return entry.is_symlink()
+    except OSError:
+        return True
+
+
 def _flush_batch(conn, batch: list[tuple]) -> None:
+    # name/ext/dirはpathから導出される値であり、path衝突時に変わることはないため
+    # SET句に含めない。SET句に列挙するだけでfiles_auトリガー(UPDATE OF name, path)が
+    # 発火し、差分スキャンのたびに全件のFTS再構築が走ってしまう。
     conn.executemany(
         """
         INSERT INTO files (path, name, ext, dir, size, mtime, is_deleted, last_seen_at)
         VALUES (?, ?, ?, ?, ?, ?, 0, ?)
         ON CONFLICT(path) DO UPDATE SET
-            name=excluded.name, ext=excluded.ext, dir=excluded.dir,
             size=excluded.size, mtime=excluded.mtime,
             is_deleted=0, last_seen_at=excluded.last_seen_at
         """,
