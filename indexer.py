@@ -155,7 +155,14 @@ def _is_hidden(entry: "os.DirEntry[str]") -> bool:
     return False
 
 
-def _is_symlink_or_reparse(entry: "os.DirEntry[str]") -> bool:
+def _is_traversal_unsafe_dir(entry: "os.DirEntry[str]") -> bool:
+    """ディレクトリとして辿ると無限ループの恐れがあるもの(シンボリックリンク/
+    ジャンクション等のリパースポイント)を判定する。ディレクトリ専用。
+
+    ファイルには適用しないこと。OneDriveのファイルオンデマンドでは通常のファイルも
+    リパースポイント属性を持つため、ファイルまで除外するとOneDrive配下(ドキュメント
+    フォルダのリダイレクト先など)が丸ごとインデックスから漏れる。
+    """
     try:
         if entry.is_symlink():
             return True
@@ -220,13 +227,17 @@ def _run_scan(
                     if _progress.cancel_requested:
                         break
                     try:
-                        if _is_symlink_or_reparse(entry) or _is_hidden(entry):
+                        if _is_hidden(entry):
                             continue
                         if entry.is_dir(follow_symlinks=False):
                             if entry.name.lower() in exclude_folders:
                                 continue
+                            if _is_traversal_unsafe_dir(entry):
+                                continue
                             stack.append(entry.path)
                         elif entry.is_file(follow_symlinks=False):
+                            if _is_symlink_file(entry):
+                                continue
                             ext = os.path.splitext(entry.name)[1].lower()
                             if ext in exclude_extensions:
                                 continue
