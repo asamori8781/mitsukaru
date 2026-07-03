@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ミツカル</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<div id="mock-banner" class="mock-banner" hidden>モックモード動作中(API未設定)</div>
+
+<header class="app-header">
+  <h1>ミツカル</h1>
+  <nav>
+    <button id="btn-nav-search" class="link-button" hidden>検索</button>
+    <button id="btn-nav-settings" class="link-button" hidden>設定</button>
+  </nav>
+</header>
+
+<main id="app-main">
+
+  <!-- 初回API設定モーダル -->
+  <div id="modal-initial-setup" class="modal-overlay" hidden>
+    <div class="modal">
+      <h2>初回設定 - API接続</h2>
+      <p class="hint">
+        検索キーワードの展開にのみ生成AIを使用します。ファイル名・パス・ファイルの内容は送信しません。<br>
+        設定しない場合は「スキップ」を選択してください(モックモードで動作します)。
+      </p>
+      <div class="form-row">
+        <label for="init-base-url">ベースURL</label>
+        <input id="init-base-url" type="text" placeholder="https://api.example.com/v1">
+      </div>
+      <div class="form-row">
+        <label for="init-api-key">APIキー</label>
+        <input id="init-api-key" type="password" placeholder="sk-...">
+      </div>
+      <div class="form-row">
+        <label for="init-model">モデル名</label>
+        <input id="init-model" type="text" placeholder="gpt-4o-mini など">
+      </div>
+      <div class="form-row">
+        <label for="init-timeout">タイムアウト秒</label>
+        <input id="init-timeout" type="number" min="1" value="20">
+      </div>
+      <div id="init-test-result" class="test-result"></div>
+      <div class="modal-actions">
+        <button id="btn-init-test" type="button" class="secondary">接続テスト</button>
+        <button id="btn-init-skip" type="button" class="secondary">スキップ(モックモード)</button>
+        <button id="btn-init-save" type="button" class="primary">保存して次へ</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 初回フォルダ選択 -->
+  <section id="view-folder-setup" class="view" hidden>
+    <h2>対象フォルダの選択</h2>
+    <p class="hint">スキャン対象を選んでください。ファイル名・パス・サイズ・更新日時のみを登録し、ファイルの中身は読み込みません。</p>
+
+    <div class="card">
+      <button id="btn-scan-all-drives" class="primary">このPCの全ドライブをスキャン</button>
+    </div>
+
+    <div class="card">
+      <h3>個別フォルダを追加</h3>
+      <div class="folder-add-row">
+        <input id="folder-setup-path-input" type="text" placeholder="フォルダのパスを入力(ネイティブダイアログが使えない環境向け)">
+        <button id="btn-folder-setup-pick" type="button" class="secondary">フォルダを選択...</button>
+        <button id="btn-folder-setup-add" type="button" class="secondary">追加</button>
+      </div>
+      <ul id="folder-setup-list" class="folder-list"></ul>
+      <button id="btn-folder-setup-start" class="primary">選択したフォルダをスキャン開始</button>
+    </div>
+  </section>
+
+  <!-- スキャン進捗 -->
+  <section id="view-scan-progress" class="view" hidden>
+    <h2 id="scan-progress-title">スキャン中...</h2>
+    <div class="card">
+      <p>処理中フォルダ: <span id="scan-current-folder">-</span></p>
+      <p>処理済み件数: <span id="scan-processed-count">0</span> 件</p>
+      <p>アクセスできなかった項目: <span id="scan-error-count">0</span> 件</p>
+      <button id="btn-scan-cancel" class="secondary">キャンセル</button>
+    </div>
+    <div id="scan-summary" class="card" hidden>
+      <h3>スキャン完了</h3>
+      <p>登録件数: <span id="summary-file-count">-</span> 件</p>
+      <p>DBファイルサイズ: <span id="summary-db-size">-</span></p>
+      <p>Phase 1(全文インデックス)予測サイズ(概算): <span id="summary-phase1">-</span></p>
+      <p class="hint">※Phase 1予測サイズは拡張子別の概算係数による見積もりです。</p>
+      <button id="btn-scan-summary-continue" class="primary">検索画面へ</button>
+    </div>
+  </section>
+
+  <!-- 検索画面 -->
+  <section id="view-search" class="view" hidden>
+    <form id="search-form">
+      <input id="search-input" type="text" placeholder="例: TSMのバックアップで詰まった時のメモ" autocomplete="off">
+      <button type="submit" class="primary">検索</button>
+    </form>
+
+    <div id="fallback-notice" class="notice" hidden></div>
+
+    <div id="expand-panel" class="card" hidden>
+      <div class="form-row">
+        <label for="keywords-input">展開キーワード(カンマ区切り。編集して再検索できます)</label>
+        <textarea id="keywords-input" rows="2"></textarea>
+      </div>
+      <div class="expand-row-inline">
+        <div class="form-row">
+          <label for="extensions-input">拡張子(カンマ区切り、空欄可)</label>
+          <input id="extensions-input" type="text" placeholder=".pdf, .docx">
+        </div>
+        <div class="form-row">
+          <label for="recency-input">直近日数(空欄可)</label>
+          <input id="recency-input" type="number" min="0">
+        </div>
+        <button id="btn-research" type="button" class="secondary">この条件で再検索</button>
+      </div>
+    </div>
+
+    <div id="results-info"></div>
+    <table id="results-table" hidden>
+      <thead>
+        <tr>
+          <th>ファイル名</th>
+          <th>フルパス</th>
+          <th>更新日時</th>
+          <th>一致キーワード</th>
+          <th>操作</th>
+        </tr>
+      </thead>
+      <tbody id="results-body"></tbody>
+    </table>
+  </section>
+
+  <!-- 設定画面 -->
+  <section id="view-settings" class="view" hidden>
+    <h2>設定</h2>
+
+    <div class="card">
+      <h3>DB統計</h3>
+      <p>登録件数: <span id="stats-file-count">-</span> 件</p>
+      <p>DBファイルサイズ: <span id="stats-db-size">-</span></p>
+      <p>Phase 1予測サイズ(概算): <span id="stats-phase1">-</span></p>
+      <p>最終フルスキャン: <span id="stats-last-full">-</span></p>
+      <p>最終差分スキャン: <span id="stats-last-diff">-</span></p>
+      <button id="btn-full-rescan" class="primary">全再スキャン</button>
+    </div>
+
+    <div class="card">
+      <h3>対象フォルダ</h3>
+      <label class="checkbox-row">
+        <input type="checkbox" id="settings-all-drives">
+        このPCの全ドライブをスキャン対象にする
+      </label>
+      <div class="folder-add-row">
+        <input id="settings-folder-path-input" type="text" placeholder="フォルダのパスを入力">
+        <button id="btn-settings-folder-pick" type="button" class="secondary">フォルダを選択...</button>
+        <button id="btn-settings-folder-add" type="button" class="secondary">追加</button>
+      </div>
+      <ul id="settings-folder-list" class="folder-list"></ul>
+    </div>
+
+    <div class="card">
+      <h3>除外設定</h3>
+      <div class="form-row">
+        <label for="settings-exclude-folders">除外フォルダ名(1行に1つ)</label>
+        <textarea id="settings-exclude-folders" rows="4"></textarea>
+      </div>
+      <div class="form-row">
+        <label for="settings-exclude-extensions">除外拡張子(1行に1つ、.付き)</label>
+        <textarea id="settings-exclude-extensions" rows="4"></textarea>
+      </div>
+      <div class="form-row">
+        <label for="settings-diff-interval">自動差分スキャン間隔(分)</label>
+        <input id="settings-diff-interval" type="number" min="1">
+      </div>
+      <button id="btn-settings-save-scan" class="primary">対象フォルダ・除外設定を保存</button>
+    </div>
+
+    <div class="card">
+      <h3>API設定</h3>
+      <label class="checkbox-row">
+        <input type="checkbox" id="settings-mock-mode">
+        モックモードで動作させる(APIを使用しない)
+      </label>
+      <div class="form-row">
+        <label for="settings-base-url">ベースURL</label>
+        <input id="settings-base-url" type="text">
+      </div>
+      <div class="form-row">
+        <label for="settings-api-key">APIキー</label>
+        <input id="settings-api-key" type="password">
+      </div>
+      <div class="form-row">
+        <label for="settings-model">モデル名</label>
+        <input id="settings-model" type="text">
+      </div>
+      <div class="form-row">
+        <label for="settings-timeout">タイムアウト秒</label>
+        <input id="settings-timeout" type="number" min="1">
+      </div>
+      <div id="settings-test-result" class="test-result"></div>
+      <div class="modal-actions">
+        <button id="btn-settings-test" type="button" class="secondary">接続テスト</button>
+        <button id="btn-settings-save-ai" type="button" class="primary">API設定を保存</button>
+      </div>
+    </div>
+
+    <button id="btn-settings-back" class="secondary" hidden>検索画面に戻る</button>
+  </section>
+
+</main>
+
+<div id="toast" class="toast" hidden></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
