@@ -5,6 +5,7 @@ import csv
 import dataclasses
 import os
 import subprocess
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -18,6 +19,7 @@ from pydantic import BaseModel
 import ai_client
 import config
 import db
+import embedder
 import indexer
 import search
 
@@ -27,6 +29,8 @@ app = FastAPI(title="ミツカル")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 _config: Optional[config.AppConfig] = None
+_embedder_instance: Optional[embedder.Embedder] = None
+_embedder_lock = threading.Lock()
 
 
 # ---- リクエストボディ ----
@@ -93,6 +97,22 @@ def _save_config(cfg: config.AppConfig) -> None:
     global _config
     _config = cfg
     config.save_config(cfg)
+
+
+def _get_embedder() -> Optional[embedder.Embedder]:
+    """埋め込みモデルのロード(重いため一度だけ行い使い回す)。未ダウンロード/
+    ロード失敗の場合はNoneを返し、呼び出し側はキーワード検索のみに縮退する。"""
+    global _embedder_instance
+    with _embedder_lock:
+        if _embedder_instance is not None:
+            return _embedder_instance
+        if not embedder.is_downloaded(config.MODELS_DIR):
+            return None
+        try:
+            _embedder_instance = embedder.Embedder(config.MODELS_DIR)
+        except embedder.EmbedderError:
+            return None
+        return _embedder_instance
 
 
 # ---- 差分スキャンの自動起動 ----
@@ -215,10 +235,24 @@ def api_post_settings(body: SettingsIn) -> dict:
 def api_stats() -> dict:
     cfg = _get_config()
     summary = indexer.compute_summary(config.DB_PATH)
+    conn = db.get_connection(config.DB_PATH)
+    try:
+        content_indexed_count = conn.execute(
+            "SELECT COUNT(*) FROM file_content WHERE error IS NULL"
+        ).fetchone()[0]
+        embedded_file_count = conn.execute(
+            "SELECT COUNT(DISTINCT file_id) FROM file_chunks"
+        ).fetchone()[0]
+    finally:
+        conn.close()
     return {
         **summary,
         "last_full_scan_at": cfg.state.last_full_scan_at,
         "last_diff_scan_at": cfg.state.last_diff_scan_at,
+        "content_indexed_count": content_indexed_count,
+        "embedded_file_count": embedded_file_count,
+        "last_content_index_at": cfg.phase1.last_content_index_at,
+        "semantic_search_available": _get_embedder() is not None,
     }
 
 
@@ -259,6 +293,40 @@ def api_scan_cancel() -> dict:
     return {"ok": True}
 
 
+# ---- Phase1: コンテンツインデックス作成エンドポイント ----
+
+def _on_content_index_finished() -> None:
+    global _embedder_instance
+    cfg = _get_config()
+    cfg.phase1.last_content_index_at = time.time()
+    _save_config(cfg)
+    # 新しく埋め込みモデルがダウンロードされた可能性があるため、次回検索時に
+    # 再ロードを試みられるようキャッシュを破棄する
+    with _embedder_lock:
+        _embedder_instance = None
+
+
+@app.post("/api/content-index/start")
+def api_content_index_start() -> dict:
+    started = indexer.start_content_index(
+        config.DB_PATH, config.MODELS_DIR, on_finish=_on_content_index_finished,
+    )
+    if not started:
+        raise HTTPException(status_code=409, detail="既にコンテンツインデックスを作成中です。")
+    return {"ok": True}
+
+
+@app.get("/api/content-index/progress")
+def api_content_index_progress() -> dict:
+    return indexer.get_content_progress()
+
+
+@app.post("/api/content-index/cancel")
+def api_content_index_cancel() -> dict:
+    indexer.cancel_content_index()
+    return {"ok": True}
+
+
 # ---- 検索系エンドポイント ----
 
 def _expand_query(cfg: config.AppConfig, query: str) -> tuple[list[str], list[str], Optional[int], bool, str]:
@@ -283,9 +351,22 @@ def api_search(body: SearchIn) -> dict:
     keywords, extensions, recency_days, fallback_used, fallback_reason = _expand_query(cfg, query)
     _maybe_trigger_stale_diff_scan(cfg)
 
+    query_vec = None
+    emb = _get_embedder()
+    if emb is not None:
+        try:
+            query_vec = emb.embed_query(query)
+        except Exception:
+            query_vec = None  # 意味検索は失敗してもキーワード検索の結果は返す
+
     conn = db.get_connection(config.DB_PATH)
     try:
-        results = search.search_files(conn, keywords, extensions or None, recency_days)
+        results = search.hybrid_search(
+            conn, keywords, extensions or None, recency_days,
+            query_vec=query_vec,
+            semantic_min_score=cfg.phase1.semantic_min_score,
+            semantic_max_results=cfg.phase1.semantic_max_results,
+        )
     finally:
         conn.close()
 
@@ -295,6 +376,7 @@ def api_search(body: SearchIn) -> dict:
         "recency_days": recency_days,
         "fallback_used": fallback_used,
         "fallback_reason": fallback_reason,
+        "semantic_search_used": query_vec is not None,
         "results": [dataclasses.asdict(r) for r in results],
     }
 
@@ -305,9 +387,11 @@ def api_search_local(body: LocalSearchIn) -> dict:
     if not keywords:
         raise HTTPException(status_code=400, detail="キーワードを入力してください。")
 
+    # キーワード編集後の再検索はAPI(生成AI・埋め込み)を一切呼ばない。
+    # 本文の全文検索(FTS)自体はローカルDB操作のみで完結するため含める。
     conn = db.get_connection(config.DB_PATH)
     try:
-        results = search.search_files(conn, keywords, body.extensions or None, body.recency_days)
+        results = search.hybrid_search(conn, keywords, body.extensions or None, body.recency_days)
     finally:
         conn.close()
 
