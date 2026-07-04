@@ -73,6 +73,27 @@ function showView(id) {
   VIEW_IDS.forEach((v) => {
     document.getElementById(v).hidden = (v !== id);
   });
+  const searchView = document.getElementById("view-search");
+  const heroActive = (id === "view-search") && !searchView.classList.contains("searched");
+  document.body.classList.toggle("hero-mode", heroActive);
+  if (heroActive) {
+    loadHeroStats();
+    document.getElementById("search-input").focus();
+  }
+}
+
+async function loadHeroStats() {
+  const el = document.getElementById("hero-stats");
+  try {
+    const stats = await api("/api/stats");
+    if (stats.file_count > 0) {
+      el.textContent = `${stats.file_count.toLocaleString("ja-JP")} 件のファイルを索引済み ・ 最終スキャン: ${formatTimestamp(stats.last_diff_scan_at || stats.last_full_scan_at)}`;
+    } else {
+      el.textContent = "まだファイルがスキャンされていません(設定画面からスキャンできます)";
+    }
+  } catch (e) {
+    el.textContent = "";
+  }
 }
 
 function updateNav() {
@@ -341,25 +362,64 @@ function wireScanEvents() {
 // ---- 検索画面 ----
 
 let lastSearchQuery = "";
+let searchInFlight = false;
+
+function setSearchBusy(message) {
+  searchInFlight = true;
+  document.getElementById("btn-search").disabled = true;
+  document.getElementById("btn-research").disabled = true;
+  const info = document.getElementById("results-info");
+  info.classList.remove("error");
+  info.innerHTML = "";
+  const spinner = document.createElement("span");
+  spinner.className = "spinner";
+  info.appendChild(spinner);
+  info.appendChild(document.createTextNode(message));
+}
+
+function clearSearchBusy() {
+  searchInFlight = false;
+  document.getElementById("btn-search").disabled = false;
+  document.getElementById("btn-research").disabled = false;
+}
+
+function showSearchError(message) {
+  const info = document.getElementById("results-info");
+  info.classList.add("error");
+  info.textContent = `エラー: ${message}`;
+  showToast(message);
+}
+
+function enterSearchedMode() {
+  document.getElementById("view-search").classList.add("searched");
+  document.body.classList.remove("hero-mode");
+}
 
 function wireSearchEvents() {
   document.getElementById("search-form").addEventListener("submit", async (ev) => {
     ev.preventDefault();
+    if (searchInFlight) return;
     const query = document.getElementById("search-input").value.trim();
     if (!query) return;
     lastSearchQuery = query;
-    document.getElementById("results-info").textContent = "検索中...";
+    enterSearchedMode();
+    const mock = window._mitsukaruStatus && window._mitsukaruStatus.mock_mode;
+    setSearchBusy(mock
+      ? "ローカル索引を検索しています..."
+      : "AIでキーワードを展開し、ローカル索引を検索しています(APIの応答に十数秒かかることがあります)...");
     try {
       const result = await api("/api/search", "POST", { query });
       renderSearchResult(result);
       schedulePendingLog(query, result.keywords.length, result.results.length);
     } catch (e) {
-      document.getElementById("results-info").textContent = "";
-      showToast(e.message);
+      showSearchError(e.message);
+    } finally {
+      clearSearchBusy();
     }
   });
 
   document.getElementById("btn-research").addEventListener("click", async () => {
+    if (searchInFlight) return;
     const keywords = document.getElementById("keywords-input").value
       .split(",").map((s) => s.trim()).filter((s) => s);
     const extensions = document.getElementById("extensions-input").value
@@ -371,6 +431,8 @@ function wireSearchEvents() {
       showToast("キーワードを入力してください。");
       return;
     }
+    setSearchBusy("この条件で再検索しています(APIは呼びません)...");
+    document.getElementById("results-info").scrollIntoView({ block: "nearest" });
     try {
       const result = await api("/api/search/local", "POST", {
         keywords, extensions, recency_days: recencyDays,
@@ -378,7 +440,9 @@ function wireSearchEvents() {
       renderResultsTable(result.results);
       updatePendingLogHitCount(keywords.length, result.results.length);
     } catch (e) {
-      showToast(e.message);
+      showSearchError(e.message);
+    } finally {
+      clearSearchBusy();
     }
   });
 }
@@ -401,6 +465,7 @@ function renderResultsTable(results) {
   const table = document.getElementById("results-table");
   const tbody = document.getElementById("results-body");
   const info = document.getElementById("results-info");
+  info.classList.remove("error");
   tbody.innerHTML = "";
 
   if (results.length === 0) {
