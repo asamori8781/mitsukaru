@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+import unicodedata
 from dataclasses import dataclass
 from typing import Optional
 
@@ -10,6 +11,27 @@ from typing import Optional
 # 短いキーワードはLIKEによる部分一致にフォールバックする。
 FTS_MIN_LEN = 3
 DEFAULT_LIMIT = 50
+
+_HIRA_TO_KATA = str.maketrans({chr(cp): chr(cp + 0x60) for cp in range(0x3041, 0x3097)})
+_KATA_TO_HIRA = str.maketrans({chr(cp): chr(cp - 0x60) for cp in range(0x30A1, 0x30F7)})
+_ASCII_TO_FULLWIDTH = str.maketrans({chr(cp): chr(cp + 0xFEE0) for cp in range(0x21, 0x7F)})
+
+
+def _keyword_variants(keyword: str) -> list[str]:
+    """表記ゆれを吸収するための照合バリアントを生成する。
+
+    trigram索引はひらがな/カタカナ、全角/半角を同一視しないため、
+    ひらがな⇔カタカナ変換・NFKC正規化(全角英数→半角等)・半角→全角変換を
+    検索側で展開してOR照合する。
+    """
+    variants: dict[str, None] = {keyword: None}
+    variants[unicodedata.normalize("NFKC", keyword)] = None
+    for base in list(variants):
+        variants[base.translate(_ASCII_TO_FULLWIDTH)] = None
+    for base in list(variants):
+        variants[base.translate(_HIRA_TO_KATA)] = None
+        variants[base.translate(_KATA_TO_HIRA)] = None
+    return list(variants)
 
 
 @dataclass
@@ -32,10 +54,7 @@ def _escape_fts_phrase(value: str) -> str:
     return value.replace('"', '""')
 
 
-def _match_keyword(conn: sqlite3.Connection, keyword: str) -> set[int]:
-    keyword = keyword.strip()
-    if not keyword:
-        return set()
+def _match_single(conn: sqlite3.Connection, keyword: str) -> set[int]:
     if len(keyword) < FTS_MIN_LEN:
         like = f"%{_escape_like(keyword)}%"
         rows = conn.execute(
@@ -54,6 +73,16 @@ def _match_keyword(conn: sqlite3.Connection, keyword: str) -> set[int]:
         (phrase,),
     ).fetchall()
     return {row[0] for row in rows}
+
+
+def _match_keyword(conn: sqlite3.Connection, keyword: str) -> set[int]:
+    keyword = keyword.strip()
+    if not keyword:
+        return set()
+    ids: set[int] = set()
+    for variant in _keyword_variants(keyword):
+        ids |= _match_single(conn, variant)
+    return ids
 
 
 def _fetch_rows(

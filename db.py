@@ -38,7 +38,20 @@ CREATE TRIGGER IF NOT EXISTS files_ad AFTER DELETE ON files BEGIN
     INSERT INTO files_fts(files_fts, rowid, name, path) VALUES('delete', old.id, old.name, old.path);
 END;
 
-CREATE TRIGGER IF NOT EXISTS files_au AFTER UPDATE ON files BEGIN
+-- 差分スキャンはsize/mtime/last_seen_at等しか更新しないため、name/pathがSET句に
+-- 含まれる時だけFTSを組み直す。無条件のAFTER UPDATEにすると差分スキャンのたびに
+-- 全ファイル分のtrigramインデックスが削除・再構築され、検索が数分単位で固まる。
+CREATE TRIGGER IF NOT EXISTS files_au AFTER UPDATE OF name, path ON files BEGIN
+    INSERT INTO files_fts(files_fts, rowid, name, path) VALUES('delete', old.id, old.name, old.path);
+    INSERT INTO files_fts(rowid, name, path) VALUES (new.id, new.name, new.path);
+END;
+"""
+
+# 旧バージョンのDB(無条件AFTER UPDATEトリガー)を新定義へ移行するためのSQL。
+# CREATE TRIGGER IF NOT EXISTSでは既存定義が置き換わらないため、明示的に作り直す。
+MIGRATE_SQL = """
+DROP TRIGGER IF EXISTS files_au;
+CREATE TRIGGER files_au AFTER UPDATE OF name, path ON files BEGIN
     INSERT INTO files_fts(files_fts, rowid, name, path) VALUES('delete', old.id, old.name, old.path);
     INSERT INTO files_fts(rowid, name, path) VALUES (new.id, new.name, new.path);
 END;
@@ -64,6 +77,7 @@ def get_connection(db_path: Path) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
 
@@ -72,6 +86,7 @@ def init_schema(db_path: Path) -> None:
     conn = get_connection(db_path)
     try:
         conn.executescript(SCHEMA_SQL)
+        conn.executescript(MIGRATE_SQL)
         conn.commit()
     finally:
         conn.close()

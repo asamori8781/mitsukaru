@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ミツカル</title>
+<link rel="icon" href="/static/logo.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -11,7 +12,16 @@
 <div id="mock-banner" class="mock-banner" hidden>モックモード動作中(API未設定)</div>
 
 <header class="app-header">
-  <h1>ミツカル</h1>
+  <div class="brand" id="header-brand">
+    <svg class="logo" viewBox="0 0 48 48" fill="none" aria-hidden="true">
+      <g stroke-linecap="round" fill="none" stroke-width="5">
+        <path d="M13 10 L31 14" stroke="currentColor"/>
+        <path d="M13 21.5 L39 26.5" stroke="var(--color-primary)"/>
+        <path d="M13 33 L31 37" stroke="currentColor"/>
+      </g>
+    </svg>
+    <h1>ミツカル</h1>
+  </div>
   <nav>
     <button id="btn-nav-search" class="link-button" hidden>検索</button>
     <button id="btn-nav-settings" class="link-button" hidden>設定</button>
@@ -95,10 +105,25 @@
 
   <!-- 検索画面 -->
   <section id="view-search" class="view" hidden>
-    <form id="search-form">
-      <input id="search-input" type="text" placeholder="例: TSMのバックアップで詰まった時のメモ" autocomplete="off">
-      <button type="submit" class="primary">検索</button>
-    </form>
+    <div id="search-hero">
+      <div class="hero-brand">
+        <svg class="logo hero-logo" viewBox="0 0 48 48" fill="none" aria-hidden="true">
+          <g stroke-linecap="round" fill="none" stroke-width="5">
+            <path d="M13 10 L31 14" stroke="currentColor"/>
+            <path d="M13 21.5 L39 26.5" stroke="var(--color-primary)"/>
+            <path d="M13 33 L31 37" stroke="currentColor"/>
+          </g>
+        </svg>
+        <h2 class="hero-title">ミツカル</h2>
+        <p class="hero-tagline">曖昧なことばから、PCの中のファイルを見つける。</p>
+      </div>
+      <form id="search-form">
+        <input id="search-input" type="text" placeholder="例: TSMのバックアップで詰まった時のメモ" autocomplete="off">
+        <button id="btn-search" type="submit" class="primary">検索</button>
+      </form>
+      <p class="hero-hint">キーワードの羅列ではなく、覚えている内容をそのまま文章で入力できます</p>
+      <p id="hero-stats" class="hero-stats"></p>
+    </div>
 
     <div id="fallback-notice" class="notice" hidden></div>
 
