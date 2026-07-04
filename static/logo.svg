@@ -1,13 +1,15 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" fill="none">
   <style>
     .stroke { stroke: #202124; }
-    .accent { fill: #1a73e8; }
+    .accent { stroke: #1a73e8; }
     @media (prefers-color-scheme: dark) {
       .stroke { stroke: #e8eaed; }
-      .accent { fill: #6aa9ff; }
+      .accent { stroke: #6aa9ff; }
     }
   </style>
-  <circle class="stroke" cx="21" cy="21" r="12" stroke-width="3.5"/>
-  <line class="stroke" x1="30" y1="30" x2="40" y2="40" stroke-width="3.5" stroke-linecap="round"/>
-  <path class="accent" d="M37 6 L38.8 10.2 L43 12 L38.8 13.8 L37 18 L35.2 13.8 L31 12 L35.2 10.2 Z"/>
+  <g stroke-linecap="round" fill="none" stroke-width="5">
+    <path class="stroke" d="M13 10 L31 14"/>
+    <path class="accent" d="M13 21.5 L39 26.5"/>
+    <path class="stroke" d="M13 33 L31 37"/>
+  </g>
 </svg>
