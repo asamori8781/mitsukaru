@@ -40,6 +40,23 @@ body {
   margin: 0;
 }
 
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.brand .logo {
+  width: 26px;
+  height: 26px;
+}
+
+/* トップページ(ヒーロー表示)中はヘッダーの小さなブランド表記を隠し、
+   画面中央の大きなロゴ・タイトルに一本化する */
+body.hero-mode #header-brand {
+  visibility: hidden;
+}
+
 .mock-banner {
   background: var(--color-warning-bg);
   color: var(--color-warning-text);
@@ -137,10 +154,44 @@ button.secondary:hover {
   text-decoration: underline;
 }
 
+/* ---- トップページ(ヒーロー) ---- */
+
+#search-hero {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  padding: 10vh 0 2rem;
+}
+
+.hero-brand {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.hero-logo {
+  width: 72px;
+  height: 72px;
+}
+
+.hero-title {
+  font-size: 2.5rem;
+  letter-spacing: 0.18em;
+  margin: 0.75rem 0 0;
+}
+
+.hero-tagline {
+  color: var(--color-muted);
+  margin: 0.75rem 0 2.25rem;
+}
+
 #search-form {
   display: flex;
   gap: 0.5rem;
   margin-bottom: 1rem;
+  width: 100%;
+  max-width: 640px;
 }
 
 #search-input {
@@ -149,6 +200,35 @@ button.secondary:hover {
   border: 1px solid var(--color-border);
   border-radius: 6px;
   font-size: 1rem;
+}
+
+.hero-hint {
+  font-size: 0.8rem;
+  color: var(--color-muted);
+  margin: 0;
+}
+
+.hero-stats {
+  font-size: 0.8rem;
+  color: var(--color-muted);
+  margin: 2.5rem 0 0;
+  min-height: 1.2em;
+}
+
+/* 一度検索したらヒーローを畳み、検索バーを上部に固定した作業画面に切り替える */
+#view-search.searched #search-hero {
+  padding: 0 0 0.5rem;
+}
+
+#view-search.searched .hero-brand,
+#view-search.searched .hero-tagline,
+#view-search.searched .hero-hint,
+#view-search.searched .hero-stats {
+  display: none;
+}
+
+#view-search.searched #search-form {
+  max-width: none;
 }
 
 .notice {
@@ -275,6 +355,39 @@ td.actions button {
 }
 
 .test-result.error {
+  color: var(--color-danger);
+}
+
+/* ---- 検索中の進捗表示 ---- */
+
+.spinner {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--color-border);
+  border-top-color: var(--color-primary);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  vertical-align: -2px;
+  margin-right: 0.5em;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+button:disabled {
+  opacity: 0.55;
+  cursor: default;
+  pointer-events: none;
+}
+
+#results-info {
+  margin-bottom: 0.75rem;
+  min-height: 1.3em;
+}
+
+#results-info.error {
   color: var(--color-danger);
 }
 
