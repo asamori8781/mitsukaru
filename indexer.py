@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Callable, Optional
 
 import db
+import embedder
+import extractor
 
 BATCH_SIZE = 2000
 
@@ -295,3 +297,212 @@ def compute_summary(db_path: Path) -> dict:
         "db_size_bytes": db_size_bytes,
         "phase1_estimate_bytes": phase1_estimate_bytes,
     }
+
+
+# ---- Phase 1: コンテンツインデックス作成(全文抽出+埋め込み) ----
+
+CHUNK_SIZE = 800
+CHUNK_OVERLAP = 100
+CONTENT_COMMIT_EVERY = 50
+
+
+def _chunk_text(text: str) -> list[str]:
+    text = text.strip()
+    if not text:
+        return []
+    if len(text) <= CHUNK_SIZE:
+        return [text]
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + CHUNK_SIZE
+        chunks.append(text[start:end])
+        if end >= len(text):
+            break
+        start = end - CHUNK_OVERLAP
+    return chunks
+
+
+@dataclass
+class ContentIndexProgress:
+    running: bool = False
+    phase: str = ""  # "downloading_model" | "indexing"
+    current_file: str = ""
+    processed_count: int = 0
+    total_count: int = 0
+    error_count: int = 0
+    embedded_count: int = 0
+    cancel_requested: bool = False
+    embedder_available: bool = True
+    started_at: Optional[float] = None
+    finished_at: Optional[float] = None
+    error_message: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "running": self.running,
+            "phase": self.phase,
+            "current_file": self.current_file,
+            "processed_count": self.processed_count,
+            "total_count": self.total_count,
+            "error_count": self.error_count,
+            "embedded_count": self.embedded_count,
+            "embedder_available": self.embedder_available,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "error_message": self.error_message,
+        }
+
+
+_content_progress = ContentIndexProgress()
+_content_start_lock = threading.Lock()
+_content_thread: Optional[threading.Thread] = None
+
+
+def get_content_progress() -> dict:
+    return _content_progress.to_dict()
+
+
+def is_content_indexing() -> bool:
+    return _content_progress.running
+
+
+def cancel_content_index() -> None:
+    _content_progress.cancel_requested = True
+
+
+def start_content_index(
+    db_path: Path,
+    models_root: Path,
+    on_finish: Optional[Callable[[], None]] = None,
+) -> bool:
+    with _content_start_lock:
+        if _content_progress.running:
+            return False
+        _content_progress.running = True
+        _content_progress.phase = "downloading_model" if not embedder.is_downloaded(models_root) else "indexing"
+        _content_progress.current_file = ""
+        _content_progress.processed_count = 0
+        _content_progress.total_count = 0
+        _content_progress.error_count = 0
+        _content_progress.embedded_count = 0
+        _content_progress.cancel_requested = False
+        _content_progress.embedder_available = True
+        _content_progress.started_at = time.time()
+        _content_progress.finished_at = None
+        _content_progress.error_message = None
+
+    global _content_thread
+
+    def _target() -> None:
+        try:
+            _run_content_index(db_path, models_root)
+        except Exception as e:  # 予期しない例外もUIへ伝える
+            _content_progress.error_message = f"コンテンツインデックス作成中に予期しないエラーが発生しました: {e}"
+        finally:
+            _content_progress.running = False
+            _content_progress.finished_at = time.time()
+            if on_finish:
+                on_finish()
+
+    _content_thread = threading.Thread(target=_target, daemon=True)
+    _content_thread.start()
+    return True
+
+
+def _run_content_index(db_path: Path, models_root: Path) -> None:
+    embedder_instance: Optional[embedder.Embedder] = None
+    try:
+        if not embedder.is_downloaded(models_root):
+            _content_progress.phase = "downloading_model"
+
+            def _on_dl_progress(name: str, downloaded: int, total: int) -> None:
+                _content_progress.current_file = f"モデルをダウンロード中: {name}"
+                _content_progress.processed_count = downloaded
+                _content_progress.total_count = total
+
+            embedder.download_model(models_root, on_progress=_on_dl_progress)
+        embedder_instance = embedder.Embedder(models_root)
+    except embedder.EmbedderError as e:
+        # 埋め込みが使えなくても全文抽出+ファイル名検索の強化(FTS)自体は続行する(縮退運転)
+        _content_progress.embedder_available = False
+        _content_progress.error_message = (
+            f"埋め込みモデルを利用できないため、全文検索のみ有効にします({e})"
+        )
+
+    _content_progress.phase = "indexing"
+    _content_progress.current_file = ""
+    _content_progress.processed_count = 0
+    _content_progress.total_count = 0
+
+    conn = db.get_connection(db_path)
+    try:
+        extractable = extractor.extractable_extensions()
+        placeholders = ",".join("?" * len(extractable))
+        rows = conn.execute(
+            f"""
+            SELECT f.id, f.path, f.ext, f.mtime FROM files f
+            LEFT JOIN file_content fc ON fc.file_id = f.id
+            WHERE f.is_deleted = 0 AND f.ext IN ({placeholders})
+              AND (fc.file_id IS NULL OR fc.extracted_at < f.mtime)
+            """,
+            list(extractable),
+        ).fetchall()
+        _content_progress.total_count = len(rows)
+
+        since_commit = 0
+        for row in rows:
+            if _content_progress.cancel_requested:
+                break
+            _content_progress.current_file = row["path"]
+
+            error: Optional[str] = None
+            text = ""
+            try:
+                text = extractor.extract_text(row["path"], row["ext"]) or ""
+            except extractor.ExtractionError as e:
+                error = str(e)
+            except (PermissionError, OSError) as e:
+                error = f"読み込みエラー: {e}"
+
+            now = time.time()
+            conn.execute(
+                """
+                INSERT INTO file_content(file_id, text, char_count, extracted_at, extractor_version, error)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(file_id) DO UPDATE SET
+                    text=excluded.text, char_count=excluded.char_count,
+                    extracted_at=excluded.extracted_at,
+                    extractor_version=excluded.extractor_version, error=excluded.error
+                """,
+                (row["id"], text, len(text), now, extractor.EXTRACTOR_VERSION, error),
+            )
+            conn.execute("DELETE FROM file_chunks WHERE file_id=?", (row["id"],))
+
+            if error:
+                _content_progress.error_count += 1
+            elif embedder_instance is not None and text.strip():
+                chunks = _chunk_text(text)
+                try:
+                    vecs = embedder_instance.embed_passages(chunks)
+                    chunk_rows = [
+                        (row["id"], i, chunk, embedder.pack_vector(vecs[i]))
+                        for i, chunk in enumerate(chunks)
+                    ]
+                    conn.executemany(
+                        "INSERT INTO file_chunks(file_id, chunk_index, chunk_text, embedding) "
+                        "VALUES (?, ?, ?, ?)",
+                        chunk_rows,
+                    )
+                    _content_progress.embedded_count += 1
+                except Exception:
+                    _content_progress.error_count += 1
+
+            _content_progress.processed_count += 1
+            since_commit += 1
+            if since_commit >= CONTENT_COMMIT_EVERY:
+                conn.commit()
+                since_commit = 0
+        conn.commit()
+    finally:
+        conn.close()

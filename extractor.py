@@ -110,6 +110,10 @@ def is_extractable(ext: str) -> bool:
     return ext in PLAIN_TEXT_EXTENSIONS or ext in _EXTRACTORS
 
 
+def extractable_extensions() -> set[str]:
+    return PLAIN_TEXT_EXTENSIONS | set(_EXTRACTORS.keys())
+
+
 def extract_text(path: str, ext: str) -> Optional[str]:
     """テキストを抽出する。対応外の拡張子はNoneを返す。抽出失敗はExtractionErrorを送出する。"""
     p = Path(path)
