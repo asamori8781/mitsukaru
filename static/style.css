@@ -391,6 +391,77 @@ button:disabled {
   color: var(--color-danger);
 }
 
+/* ---- コンテンツインデックス進捗 ---- */
+
+.content-index-progress {
+  margin-top: 0.75rem;
+}
+
+.progress-bar-track {
+  background: var(--color-border);
+  border-radius: 6px;
+  height: 8px;
+  overflow: hidden;
+  margin: 0.5rem 0;
+}
+
+.progress-bar-fill {
+  background: var(--color-primary);
+  height: 100%;
+  width: 0%;
+  transition: width 0.2s ease;
+}
+
+/* ---- 検索結果: 一致根拠のバッジとスニペット ---- */
+
+.match-badges {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  align-items: flex-start;
+}
+
+.badge {
+  display: inline-block;
+  font-size: 0.75rem;
+  padding: 0.1rem 0.5rem;
+  border-radius: 999px;
+  background: #e8eefc;
+  color: var(--color-primary-dark);
+  white-space: nowrap;
+}
+
+.badge.badge-content {
+  background: #e6f4ea;
+  color: #1e7e34;
+}
+
+.badge.badge-semantic {
+  background: #fdece8;
+  color: #b3441e;
+}
+
+.snippet {
+  font-size: 0.8rem;
+  color: var(--color-muted);
+  margin: 0.2rem 0 0;
+}
+
+@media (prefers-color-scheme: dark) {
+  .badge {
+    background: #29344d;
+    color: #9db8f5;
+  }
+  .badge.badge-content {
+    background: #1e3324;
+    color: #7fce97;
+  }
+  .badge.badge-semantic {
+    background: #3a241d;
+    color: #f0a582;
+  }
+}
+
 .toast {
   position: fixed;
   bottom: 1.5rem;

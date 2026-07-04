@@ -461,6 +461,39 @@ function renderSearchResult(result) {
   renderResultsTable(result.results);
 }
 
+function renderMatchBasis(r) {
+  const wrap = document.createElement("div");
+  wrap.className = "match-badges";
+
+  if (r.matched_keywords && r.matched_keywords.length > 0) {
+    if (r.matched_in_name) {
+      const b = document.createElement("span");
+      b.className = "badge";
+      b.textContent = "ファイル名: " + r.matched_keywords.join(", ");
+      wrap.appendChild(b);
+    }
+    if (r.matched_in_content) {
+      const b = document.createElement("span");
+      b.className = "badge badge-content";
+      b.textContent = "本文: " + r.matched_keywords.join(", ");
+      wrap.appendChild(b);
+    }
+  }
+  if (r.semantic_score !== null && r.semantic_score !== undefined) {
+    const b = document.createElement("span");
+    b.className = "badge badge-semantic";
+    b.textContent = `意味検索(類似度 ${r.semantic_score.toFixed(2)})`;
+    wrap.appendChild(b);
+    if (r.snippet) {
+      const s = document.createElement("p");
+      s.className = "snippet";
+      s.textContent = r.snippet;
+      wrap.appendChild(s);
+    }
+  }
+  return wrap;
+}
+
 function renderResultsTable(results) {
   const table = document.getElementById("results-table");
   const tbody = document.getElementById("results-body");
@@ -474,7 +507,12 @@ function renderResultsTable(results) {
     return;
   }
 
-  info.textContent = `${results.length} 件見つかりました(上限50件)`;
+  const semanticCount = results.filter((r) => r.semantic_score !== null && r.semantic_score !== undefined).length;
+  let text = `${results.length} 件見つかりました(上限50件)`;
+  if (semanticCount > 0) {
+    text += ` (うち意味検索による補完 ${semanticCount} 件)`;
+  }
+  info.textContent = text;
   table.hidden = false;
 
   results.forEach((r) => {
@@ -492,9 +530,9 @@ function renderResultsTable(results) {
     tdMtime.textContent = formatTimestamp(r.mtime);
     tr.appendChild(tdMtime);
 
-    const tdKeywords = document.createElement("td");
-    tdKeywords.textContent = r.matched_keywords.join(", ");
-    tr.appendChild(tdKeywords);
+    const tdBasis = document.createElement("td");
+    tdBasis.appendChild(renderMatchBasis(r));
+    tr.appendChild(tdBasis);
 
     const tdActions = document.createElement("td");
     tdActions.className = "actions";
@@ -558,6 +596,20 @@ async function loadSettingsView() {
   document.getElementById("stats-phase1").textContent = formatBytes(stats.phase1_estimate_bytes);
   document.getElementById("stats-last-full").textContent = formatTimestamp(stats.last_full_scan_at);
   document.getElementById("stats-last-diff").textContent = formatTimestamp(stats.last_diff_scan_at);
+
+  document.getElementById("stats-content-indexed").textContent = stats.content_indexed_count;
+  document.getElementById("stats-file-count-2").textContent = stats.file_count;
+  document.getElementById("stats-embedded-count").textContent = stats.embedded_file_count;
+  document.getElementById("stats-semantic-available").textContent =
+    stats.semantic_search_available ? "利用可能" : "未ダウンロード(インデックス作成時に自動取得)";
+  document.getElementById("stats-last-content-index").textContent = formatTimestamp(stats.last_content_index_at);
+
+  const progress = await api("/api/content-index/progress");
+  if (progress.running) {
+    document.getElementById("content-index-progress").hidden = false;
+    document.getElementById("btn-content-index-start").disabled = true;
+    pollContentIndexProgress();
+  }
 }
 
 function wireSettingsEvents() {
@@ -666,6 +718,67 @@ function wireSettingsEvents() {
   });
 }
 
+// ---- コンテンツインデックス作成(Phase 1) ----
+
+const CONTENT_INDEX_PHASE_LABELS = {
+  downloading_model: "埋め込みモデルをダウンロード中(初回のみ、数十〜100MB程度)...",
+  indexing: "ファイルを処理中...",
+};
+
+let contentIndexPollTimer = null;
+
+function wireContentIndexEvents() {
+  document.getElementById("btn-content-index-start").addEventListener("click", async () => {
+    try {
+      await api("/api/content-index/start", "POST", {});
+    } catch (e) {
+      showToast(e.message);
+      return;
+    }
+    document.getElementById("content-index-progress").hidden = false;
+    document.getElementById("btn-content-index-start").disabled = true;
+    pollContentIndexProgress();
+  });
+
+  document.getElementById("btn-content-index-cancel").addEventListener("click", async () => {
+    await api("/api/content-index/cancel", "POST", {});
+  });
+}
+
+function pollContentIndexProgress() {
+  clearTimeout(contentIndexPollTimer);
+  const poll = async () => {
+    let progress;
+    try {
+      progress = await api("/api/content-index/progress");
+    } catch (e) {
+      return;
+    }
+    document.getElementById("content-index-phase-label").textContent =
+      CONTENT_INDEX_PHASE_LABELS[progress.phase] || "";
+    const total = progress.total_count || 0;
+    const pct = total > 0 ? Math.min(100, Math.round((progress.processed_count / total) * 100)) : 0;
+    document.getElementById("content-index-progress-bar").style.width = pct + "%";
+    document.getElementById("content-index-detail").textContent =
+      `${progress.processed_count} / ${total}件 (エラー: ${progress.error_count}件, 埋め込み: ${progress.embedded_count}件) `
+      + (progress.current_file ? `現在: ${progress.current_file}` : "");
+
+    if (progress.running) {
+      contentIndexPollTimer = setTimeout(poll, 500);
+      return;
+    }
+
+    document.getElementById("btn-content-index-start").disabled = false;
+    if (progress.error_message) {
+      showToast(progress.error_message);
+    } else {
+      showToast("コンテンツインデックスの作成が完了しました。");
+    }
+    await loadSettingsView();
+  };
+  poll();
+}
+
 // ---- イベント登録 ----
 
 function wireEvents() {
@@ -674,6 +787,7 @@ function wireEvents() {
   wireScanEvents();
   wireSearchEvents();
   wireSettingsEvents();
+  wireContentIndexEvents();
 }
 
 document.addEventListener("DOMContentLoaded", init);

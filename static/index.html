@@ -152,7 +152,7 @@
           <th>ファイル名</th>
           <th>フルパス</th>
           <th>更新日時</th>
-          <th>一致キーワード</th>
+          <th>一致の根拠</th>
           <th>操作</th>
         </tr>
       </thead>
@@ -172,6 +172,28 @@
       <p>最終フルスキャン: <span id="stats-last-full">-</span></p>
       <p>最終差分スキャン: <span id="stats-last-diff">-</span></p>
       <button id="btn-full-rescan" class="primary">全再スキャン</button>
+    </div>
+
+    <div class="card">
+      <h3>コンテンツインデックス(Phase 1: 全文検索・意味検索)</h3>
+      <p class="hint">
+        対応形式(.txt/.md等のテキスト系/.pdf/.docx/.xlsx/.pptx)の本文を読み取り、
+        本文全文検索と意味検索(埋め込みモデルによる類似検索)を有効にします。
+        埋め込みモデルは初回作成時にインターネットから自動ダウンロードされます(約100MB)。
+      </p>
+      <p>本文インデックス済み: <span id="stats-content-indexed">-</span> / <span id="stats-file-count-2">-</span> 件</p>
+      <p>意味検索(埋め込み)対象: <span id="stats-embedded-count">-</span> 件</p>
+      <p>意味検索: <span id="stats-semantic-available">-</span></p>
+      <p>最終インデックス作成: <span id="stats-last-content-index">-</span></p>
+      <button id="btn-content-index-start" class="primary">コンテンツインデックスを作成・更新</button>
+      <div id="content-index-progress" class="content-index-progress" hidden>
+        <p id="content-index-phase-label"></p>
+        <div class="progress-bar-track">
+          <div id="content-index-progress-bar" class="progress-bar-fill"></div>
+        </div>
+        <p id="content-index-detail" class="hint"></p>
+        <button id="btn-content-index-cancel" class="secondary">キャンセル</button>
+      </div>
     </div>
 
     <div class="card">

@@ -21,6 +21,7 @@ CONFIG_PATH = DATA_DIR / "config.json"
 DB_PATH = DATA_DIR / "mitsukaru.db"
 API_LOG_PATH = LOGS_DIR / "api_log.jsonl"
 USAGE_LOG_PATH = LOGS_DIR / "usage_log.csv"
+MODELS_DIR = DATA_DIR / "models"
 
 DEFAULT_EXCLUDE_FOLDERS = [
     "Windows",
@@ -65,10 +66,18 @@ class ScanState:
 
 
 @dataclass
+class Phase1Config:
+    semantic_min_score: float = 0.75
+    semantic_max_results: int = 10
+    last_content_index_at: Optional[float] = None
+
+
+@dataclass
 class AppConfig:
     ai: AIConfig = field(default_factory=AIConfig)
     scan: ScanConfig = field(default_factory=ScanConfig)
     state: ScanState = field(default_factory=ScanState)
+    phase1: Phase1Config = field(default_factory=Phase1Config)
 
 
 def config_exists() -> bool:
@@ -96,6 +105,7 @@ def load_config() -> AppConfig:
         ai=AIConfig(**_merge_known_fields(AIConfig(), raw.get("ai", {}))),
         scan=ScanConfig(**_merge_known_fields(ScanConfig(), raw.get("scan", {}))),
         state=ScanState(**_merge_known_fields(ScanState(), raw.get("state", {}))),
+        phase1=Phase1Config(**_merge_known_fields(Phase1Config(), raw.get("phase1", {}))),
     )
 
 
