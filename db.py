@@ -45,6 +45,51 @@ CREATE TRIGGER IF NOT EXISTS files_au AFTER UPDATE OF name, path ON files BEGIN
     INSERT INTO files_fts(files_fts, rowid, name, path) VALUES('delete', old.id, old.name, old.path);
     INSERT INTO files_fts(rowid, name, path) VALUES (new.id, new.name, new.path);
 END;
+
+-- Phase 1: 抽出した本文テキスト(files 1:1)。extracted_atはfiles.mtimeと比較して
+-- 再抽出が必要かどうかを判定するための基準時刻(抽出失敗時もこの行自体は作成し、
+-- errorに理由を記録することで、失敗ファイルへの再試行を毎回繰り返さない)。
+CREATE TABLE IF NOT EXISTS file_content (
+    file_id           INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+    text              TEXT NOT NULL,
+    char_count        INTEGER NOT NULL,
+    extracted_at      REAL NOT NULL,
+    extractor_version INTEGER NOT NULL,
+    error             TEXT
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS file_content_fts USING fts5(
+    text, content='file_content', content_rowid='file_id', tokenize='trigram'
+);
+
+CREATE TRIGGER IF NOT EXISTS file_content_ai AFTER INSERT ON file_content BEGIN
+    INSERT INTO file_content_fts(rowid, text) VALUES (new.file_id, new.text);
+END;
+
+CREATE TRIGGER IF NOT EXISTS file_content_ad AFTER DELETE ON file_content BEGIN
+    INSERT INTO file_content_fts(file_content_fts, rowid, text) VALUES('delete', old.file_id, old.text);
+END;
+
+CREATE TRIGGER IF NOT EXISTS file_content_au AFTER UPDATE OF text ON file_content BEGIN
+    INSERT INTO file_content_fts(file_content_fts, rowid, text) VALUES('delete', old.file_id, old.text);
+    INSERT INTO file_content_fts(rowid, text) VALUES (new.file_id, new.text);
+END;
+
+-- files削除(論理削除ではなく物理削除)時にfile_contentも連動して消えるよう、
+-- 外部キーのON DELETE CASCADEを利用する(get_connectionでPRAGMA foreign_keys=ONが必要)。
+
+-- Phase 1: チャンク分割した本文と埋め込みベクトル(files 1:N)。
+-- embeddingはfloat32配列をnumpy.tobytes()でパックしたBLOB。
+CREATE TABLE IF NOT EXISTS file_chunks (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_id     INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    chunk_index INTEGER NOT NULL,
+    chunk_text  TEXT NOT NULL,
+    embedding   BLOB NOT NULL,
+    UNIQUE(file_id, chunk_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_file_chunks_file_id ON file_chunks(file_id);
 """
 
 # 旧バージョンのDB(無条件AFTER UPDATEトリガー)を新定義へ移行するためのSQL。
@@ -78,6 +123,7 @@ def get_connection(db_path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
 
