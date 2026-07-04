@@ -64,10 +64,13 @@ python main.py
 
 ```bash
 pip install pyinstaller
-pyinstaller --name mitsukaru --onedir --windowed --add-data "static;static" main.py
+pyinstaller --name mitsukaru --onedir --windowed --icon assets/icon.ico --add-data "static;static" main.py
 ```
 
 - macOS/Linuxでビルドする場合は `--add-data "static:static"`(区切り文字が `:`)にしてください。
+- `--icon assets/icon.ico` によりexeとウィンドウのタイトルバー・タスクバーにミツカルのロゴが
+  表示されます。開発中の `python main.py` 実行ではWindowsの仕様上Pythonの既定アイコンが
+  表示されますが、ビルド後は専用ロゴになります。
 - 生成物は `dist/mitsukaru/` 配下に展開されます。`data/` と `logs/` は実行ファイルと同階層に
   自動生成されるため、フォルダごとコピーすればポータブルに動作します。
 - **想定サイズ目安**: FastAPI/Starlette/Uvicorn/pywebview/requests一式とPythonランタイムを
@@ -86,6 +89,23 @@ pyinstaller --name mitsukaru --onedir --windowed --add-data "static;static" main
 - 送受信内容は `logs/api_log.jsonl` にローカル保存されます(透明性ログ、APIキーは記録しません)。
 - 別のPCや業務環境へ展開する際は、`data/config.json` を差し替えるだけで接続先を
   切り替えられます(接続情報はコードにハードコードしていません)。
+
+## 検索の仕組みと制約(Phase 0)
+
+- 検索対象は**ファイル名とフルパスのみ**です。ファイルの中身は索引していないため、
+  ファイル名に手がかりがない場合はヒットしません(Phase 1の全文インデックスで解消予定)。
+- ひらがな/カタカナ・全角/半角の表記ゆれは検索側で自動吸収します
+  (例: 「ふくすぽ」で「フクスポ大会管理表.xlsx」がヒットします)。
+- OneDrive配下(ファイルオンデマンドのプレースホルダー)もスキャン対象です。
+  フォルダのシンボリックリンク・ジャンクションは無限ループ防止のため辿りません。
+
+## 旧バージョンからの更新時の注意
+
+- 差分スキャンの性能問題(検索が長時間固まる)を修正した版へ更新した場合、
+  既存の `data/mitsukaru.db` は起動時に自動移行されます。ただし旧版で肥大化した
+  DBを整理し、OneDrive配下など旧版で索引から漏れていたファイルを取り込むため、
+  **更新後に設定画面から一度「全再スキャン」を実行することを推奨**します
+  (よりきれいにしたい場合はアプリ停止中に `data/mitsukaru.db` を削除して再スキャン)。
 
 ## Phase 1で追加予定の機能(Phase 0のスコープ外)
 
