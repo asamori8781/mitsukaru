@@ -2,3 +2,7 @@ fastapi
 uvicorn
 pywebview
 requests
+pypdf
+python-docx
+openpyxl
+python-pptx
