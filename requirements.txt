@@ -6,3 +6,6 @@ pypdf
 python-docx
 openpyxl
 python-pptx
+numpy
+onnxruntime
+tokenizers
