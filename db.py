@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS files (
 
 CREATE INDEX IF NOT EXISTS idx_files_is_deleted ON files(is_deleted);
 CREATE INDEX IF NOT EXISTS idx_files_mtime ON files(mtime);
+CREATE INDEX IF NOT EXISTS idx_files_ext ON files(ext);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
     name,
@@ -49,13 +50,17 @@ END;
 -- Phase 1: 抽出した本文テキスト(files 1:1)。extracted_atはfiles.mtimeと比較して
 -- 再抽出が必要かどうかを判定するための基準時刻(抽出失敗時もこの行自体は作成し、
 -- errorに理由を記録することで、失敗ファイルへの再試行を毎回繰り返さない)。
+-- embedded_atは埋め込みモデルが利用可能な状態で埋め込み処理を試みた時刻。
+-- 埋め込みモデル未ダウンロードのまま抽出だけ行った(縮退運転)場合はNULLのまま
+-- とし、後でモデルが使えるようになった際に埋め込みだけ再試行できるようにする。
 CREATE TABLE IF NOT EXISTS file_content (
     file_id           INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
     text              TEXT NOT NULL,
     char_count        INTEGER NOT NULL,
     extracted_at      REAL NOT NULL,
     extractor_version INTEGER NOT NULL,
-    error             TEXT
+    error             TEXT,
+    embedded_at       REAL
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS file_content_fts USING fts5(
@@ -127,12 +132,24 @@ def get_connection(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(row[1] == column for row in rows)
+
+
+def _migrate_columns(conn: sqlite3.Connection) -> None:
+    # SQLiteに「ALTER TABLE ADD COLUMN IF NOT EXISTS」はないため存在確認してから追加する。
+    if not _column_exists(conn, "file_content", "embedded_at"):
+        conn.execute("ALTER TABLE file_content ADD COLUMN embedded_at REAL")
+
+
 def init_schema(db_path: Path) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = get_connection(db_path)
     try:
         conn.executescript(SCHEMA_SQL)
         conn.executescript(MIGRATE_SQL)
+        _migrate_columns(conn)
         conn.commit()
     finally:
         conn.close()
