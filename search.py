@@ -94,15 +94,7 @@ def _match_keyword(conn: sqlite3.Connection, keyword: str) -> set[int]:
     return ids
 
 
-def _match_content_single(conn: sqlite3.Connection, keyword: str) -> set[int]:
-    if len(keyword) < FTS_MIN_LEN:
-        like = f"%{_escape_like(keyword)}%"
-        rows = conn.execute(
-            "SELECT fc.file_id FROM file_content fc JOIN files f ON f.id = fc.file_id "
-            "WHERE f.is_deleted=0 AND fc.text LIKE ? ESCAPE '\\'",
-            (like,),
-        ).fetchall()
-        return {row[0] for row in rows}
+def _match_content_fts(conn: sqlite3.Connection, keyword: str) -> set[int]:
     phrase = '"' + _escape_fts_phrase(keyword) + '"'
     rows = conn.execute(
         """
@@ -116,14 +108,47 @@ def _match_content_single(conn: sqlite3.Connection, keyword: str) -> set[int]:
     return {row[0] for row in rows}
 
 
-def _match_content_keyword(conn: sqlite3.Connection, keyword: str) -> set[int]:
-    keyword = keyword.strip()
-    if not keyword:
-        return set()
-    ids: set[int] = set()
-    for variant in _keyword_variants(keyword):
-        ids |= _match_content_single(conn, variant)
-    return ids
+SHORT_LIKE_BATCH = 15
+
+
+def _match_content_keywords(conn: sqlite3.Connection, keywords: list[str]) -> dict[str, set[int]]:
+    """本文に対するキーワード照合をまとめて行う。
+
+    trigramで引けない短いキーワード(3文字未満)のLIKE照合は本文全体の
+    走査になるため、キーワード×バリアントごとに個別クエリを発行すると
+    走査が繰り返されて遅い。全バリアントをまとめ、1回の走査で各バリアントの
+    一致を同時判定してからキーワード単位に集計する。
+    """
+    result: dict[str, set[int]] = {kw: set() for kw in keywords}
+    short_jobs: list[tuple[str, str]] = []  # (元キーワード, バリアント)
+    for kw in keywords:
+        stripped = kw.strip()
+        if not stripped:
+            continue
+        for variant in _keyword_variants(stripped):
+            if len(variant) < FTS_MIN_LEN:
+                short_jobs.append((kw, variant))
+            else:
+                result[kw] |= _match_content_fts(conn, variant)
+
+    for start in range(0, len(short_jobs), SHORT_LIKE_BATCH):
+        batch = short_jobs[start:start + SHORT_LIKE_BATCH]
+        like_params = [f"%{_escape_like(v)}%" for _, v in batch]
+        select_cols = ", ".join(
+            f"(fc.text LIKE ? ESCAPE '\\') AS m{i}" for i in range(len(batch))
+        )
+        where = " OR ".join(f"(fc.text LIKE ? ESCAPE '\\')" for _ in batch)
+        rows = conn.execute(
+            f"SELECT fc.file_id, {select_cols} FROM file_content fc "
+            f"JOIN files f ON f.id = fc.file_id "
+            f"WHERE f.is_deleted = 0 AND ({where})",
+            like_params + like_params,
+        ).fetchall()
+        for row in rows:
+            for i, (kw, _) in enumerate(batch):
+                if row[f"m{i}"]:
+                    result[kw].add(row["file_id"])
+    return result
 
 
 def _fetch_rows(
@@ -211,9 +236,13 @@ def semantic_search(
     読み出してスコア計算し、チャンク本文は上位ヒット分だけ後から取得する。
     戻り値は類似度降順の (file_id, スコア, 最も類似したチャンクの抜粋)。
     """
+    # 埋め込みモデルを差し替えた場合など、次元の異なる古いベクトルが残っていると
+    # 行列計算が壊れるため、クエリと同じバイト長のものだけを対象にする。
     cursor = conn.execute(
         "SELECT fch.id, fch.file_id, fch.embedding FROM file_chunks fch "
-        "JOIN files f ON f.id = fch.file_id WHERE f.is_deleted = 0"
+        "JOIN files f ON f.id = fch.file_id "
+        "WHERE f.is_deleted = 0 AND length(fch.embedding) = ?",
+        (int(query_vec.nbytes),),
     )
     best: dict[int, tuple[float, int]] = {}  # file_id -> (score, chunk_id)
     while True:
@@ -267,10 +296,11 @@ def hybrid_search(
     """
     name_match_map: dict[int, set[str]] = {}
     content_match_map: dict[int, set[str]] = {}
+    content_matches = _match_content_keywords(conn, keywords)
     for keyword in keywords:
         for file_id in _match_keyword(conn, keyword):
             name_match_map.setdefault(file_id, set()).add(keyword)
-        for file_id in _match_content_keyword(conn, keyword):
+        for file_id in content_matches.get(keyword, set()):
             content_match_map.setdefault(file_id, set()).add(keyword)
 
     keyword_ids = list(set(name_match_map) | set(content_match_map))
