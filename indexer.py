@@ -304,6 +304,38 @@ def compute_summary(db_path: Path) -> dict:
 CHUNK_SIZE = 800
 CHUNK_OVERLAP = 100
 CONTENT_COMMIT_EVERY = 50
+EXTRACTION_TIMEOUT_SEC = 60
+
+
+def _extract_with_timeout(path: str, ext: str) -> tuple[str, Optional[str]]:
+    """extract_textを別スレッドで実行し、一定時間で見切りをつける。
+
+    壊れた/巨大なファイルの解析がフリーズすると、Pythonでは実行中のスレッドを
+    安全に強制終了できないため、daemonスレッド+join(timeout)で「諦めて次の
+    ファイルへ進む」形にする。タイムアウトしたスレッド自体は残り続けるが、
+    daemon指定によりアプリの終了は妨げない。これによりキャンセルボタンも
+    最大でもこの秒数以内には反映されるようになる。
+    """
+    result: dict = {}
+
+    def _worker() -> None:
+        try:
+            result["text"] = extractor.extract_text(path, ext) or ""
+        except extractor.ExtractionError as e:
+            result["error"] = str(e)
+        except (PermissionError, OSError) as e:
+            result["error"] = f"読み込みエラー: {e}"
+        except Exception as e:
+            result["error"] = f"予期しないエラー: {e}"
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join(EXTRACTION_TIMEOUT_SEC)
+    if t.is_alive():
+        return "", f"抽出が{EXTRACTION_TIMEOUT_SEC}秒以内に完了しなかったためスキップしました"
+    if "error" in result:
+        return "", result["error"]
+    return result.get("text", ""), None
 
 
 def _chunk_text(text: str) -> list[str]:
@@ -423,8 +455,9 @@ def _run_content_index(db_path: Path, models_root: Path) -> None:
 
             embedder.download_model(models_root, on_progress=_on_dl_progress)
         embedder_instance = embedder.Embedder(models_root)
-    except embedder.EmbedderError as e:
-        # 埋め込みが使えなくても全文抽出+ファイル名検索の強化(FTS)自体は続行する(縮退運転)
+    except Exception as e:
+        # 埋め込みが使えなくても全文抽出+ファイル名検索の強化(FTS)自体は続行する(縮退運転)。
+        # onnxruntime/tokenizersが投げうる例外はEmbedderError以外もあり得るため広く捕捉する。
         _content_progress.embedder_available = False
         _content_progress.error_message = (
             f"埋め込みモデルを利用できないため、全文検索のみ有効にします({e})"
@@ -439,12 +472,16 @@ def _run_content_index(db_path: Path, models_root: Path) -> None:
     try:
         extractable = extractor.extractable_extensions()
         placeholders = ",".join("?" * len(extractable))
+        # 未抽出/更新されたファイルに加え、埋め込みモデルが今回利用可能なら、
+        # 過去に縮退運転(モデル未利用)で抽出だけ済ませたファイルも埋め込み対象に含める。
+        condition = "(fc.file_id IS NULL OR fc.extracted_at < f.mtime)"
+        if embedder_instance is not None:
+            condition = f"({condition} OR (fc.error IS NULL AND fc.embedded_at IS NULL))"
         rows = conn.execute(
             f"""
             SELECT f.id, f.path, f.ext, f.mtime FROM files f
             LEFT JOIN file_content fc ON fc.file_id = f.id
-            WHERE f.is_deleted = 0 AND f.ext IN ({placeholders})
-              AND (fc.file_id IS NULL OR fc.extracted_at < f.mtime)
+            WHERE f.is_deleted = 0 AND f.ext IN ({placeholders}) AND {condition}
             """,
             list(extractable),
         ).fetchall()
@@ -456,47 +493,62 @@ def _run_content_index(db_path: Path, models_root: Path) -> None:
                 break
             _content_progress.current_file = row["path"]
 
-            error: Optional[str] = None
-            text = ""
-            try:
-                text = extractor.extract_text(row["path"], row["ext"]) or ""
-            except extractor.ExtractionError as e:
-                error = str(e)
-            except (PermissionError, OSError) as e:
-                error = f"読み込みエラー: {e}"
+            # 既に本文抽出済み(縮退運転で埋め込みだけ未処理)で、かつファイルが更新されて
+            # いない場合に限り再抽出をスキップし、保存済みのテキストを使って埋め込みだけ行う。
+            # mtimeが進んでいる場合は内容が変わっている可能性があるため必ず再抽出する。
+            existing = conn.execute(
+                "SELECT text, error, extracted_at FROM file_content WHERE file_id=?", (row["id"],)
+            ).fetchone()
+            needs_reextract = (
+                existing is None
+                or existing["error"] is not None
+                or existing["extracted_at"] < row["mtime"]
+            )
+            if needs_reextract:
+                text, error = _extract_with_timeout(row["path"], row["ext"])
+            else:
+                text, error = existing["text"], None
+
+            # 再実行のたびに前回分のチャンクを一旦破棄してから作り直す(内容が変わって
+            # いる可能性・埋め込み失敗からのリトライの両方に対応するための単純な方式)。
+            conn.execute("DELETE FROM file_chunks WHERE file_id=?", (row["id"],))
 
             now = time.time()
+            embedded_at = None
+            if error:
+                _content_progress.error_count += 1
+            elif embedder_instance is not None:
+                embedded_at = now  # 空文書などでチャンク0件でも「試みた」ことにして無限リトライを避ける
+                if text.strip():
+                    chunks = _chunk_text(text)
+                    try:
+                        vecs = embedder_instance.embed_passages(chunks)
+                        chunk_rows = [
+                            (row["id"], i, chunk, embedder.pack_vector(vecs[i]))
+                            for i, chunk in enumerate(chunks)
+                        ]
+                        conn.executemany(
+                            "INSERT INTO file_chunks(file_id, chunk_index, chunk_text, embedding) "
+                            "VALUES (?, ?, ?, ?)",
+                            chunk_rows,
+                        )
+                        _content_progress.embedded_count += 1
+                    except Exception:
+                        _content_progress.error_count += 1
+                        embedded_at = None  # 失敗時は次回また埋め込みを試みる
+
             conn.execute(
                 """
-                INSERT INTO file_content(file_id, text, char_count, extracted_at, extractor_version, error)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO file_content(file_id, text, char_count, extracted_at, extractor_version, error, embedded_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(file_id) DO UPDATE SET
                     text=excluded.text, char_count=excluded.char_count,
                     extracted_at=excluded.extracted_at,
-                    extractor_version=excluded.extractor_version, error=excluded.error
+                    extractor_version=excluded.extractor_version, error=excluded.error,
+                    embedded_at=excluded.embedded_at
                 """,
-                (row["id"], text, len(text), now, extractor.EXTRACTOR_VERSION, error),
+                (row["id"], text, len(text), now, extractor.EXTRACTOR_VERSION, error, embedded_at),
             )
-            conn.execute("DELETE FROM file_chunks WHERE file_id=?", (row["id"],))
-
-            if error:
-                _content_progress.error_count += 1
-            elif embedder_instance is not None and text.strip():
-                chunks = _chunk_text(text)
-                try:
-                    vecs = embedder_instance.embed_passages(chunks)
-                    chunk_rows = [
-                        (row["id"], i, chunk, embedder.pack_vector(vecs[i]))
-                        for i, chunk in enumerate(chunks)
-                    ]
-                    conn.executemany(
-                        "INSERT INTO file_chunks(file_id, chunk_index, chunk_text, embedding) "
-                        "VALUES (?, ?, ?, ?)",
-                        chunk_rows,
-                    )
-                    _content_progress.embedded_count += 1
-                except Exception:
-                    _content_progress.error_count += 1
 
             _content_progress.processed_count += 1
             since_commit += 1
