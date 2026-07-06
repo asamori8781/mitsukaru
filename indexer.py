@@ -303,7 +303,6 @@ def compute_summary(db_path: Path) -> dict:
 
 CHUNK_SIZE = 800
 CHUNK_OVERLAP = 100
-CONTENT_COMMIT_EVERY = 50
 EXTRACTION_TIMEOUT_SEC = 60
 
 
@@ -519,7 +518,6 @@ def _run_content_index(db_path: Path, models_root: Path, error_log_path: Optiona
         ).fetchall()
         _content_progress.total_count = len(rows)
 
-        since_commit = 0
         for row in rows:
             if _content_progress.cancel_requested:
                 break
@@ -541,12 +539,12 @@ def _run_content_index(db_path: Path, models_root: Path, error_log_path: Optiona
             else:
                 text, error = existing["text"], None
 
-            # 再実行のたびに前回分のチャンクを一旦破棄してから作り直す(内容が変わって
-            # いる可能性・埋め込み失敗からのリトライの両方に対応するための単純な方式)。
-            conn.execute("DELETE FROM file_chunks WHERE file_id=?", (row["id"],))
-
+            # 埋め込みの計算はDBへの書き込みを始める前に済ませる。書き込み開始後に
+            # 重い推論を挟むと、その間ずっとSQLiteの書き込みロックを保持してしまい、
+            # 並行する差分スキャンが「database is locked」で失敗し得るため。
             now = time.time()
             embedded_at = None
+            chunk_rows: Optional[list[tuple]] = None
             if error:
                 _content_progress.error_count += 1
                 _content_progress.extract_error_count += 1
@@ -561,36 +559,49 @@ def _run_content_index(db_path: Path, models_root: Path, error_log_path: Optiona
                             (row["id"], i, chunk, embedder.pack_vector(vecs[i]))
                             for i, chunk in enumerate(chunks)
                         ]
-                        conn.executemany(
-                            "INSERT INTO file_chunks(file_id, chunk_index, chunk_text, embedding) "
-                            "VALUES (?, ?, ?, ?)",
-                            chunk_rows,
-                        )
-                        _content_progress.embedded_count += 1
                     except Exception as e:
                         _content_progress.error_count += 1
                         _content_progress.embed_error_count += 1
                         _log_content_error(error_log_path, "embed", row["path"], str(e))
                         embedded_at = None  # 失敗時は次回また埋め込みを試みる
 
-            conn.execute(
-                """
-                INSERT INTO file_content(file_id, text, char_count, extracted_at, extractor_version, error, embedded_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(file_id) DO UPDATE SET
-                    text=excluded.text, char_count=excluded.char_count,
-                    extracted_at=excluded.extracted_at,
-                    extractor_version=excluded.extractor_version, error=excluded.error,
-                    embedded_at=excluded.embedded_at
-                """,
-                (row["id"], text, len(text), now, extractor.EXTRACTOR_VERSION, error, embedded_at),
-            )
+            # ここからDB書き込み。1ファイル分をまとめて短時間で書き、都度コミットして
+            # ロック保持時間を最小化する(WAL+synchronous=NORMALでは都度コミットは安価)。
+            if needs_reextract:
+                conn.execute(
+                    """
+                    INSERT INTO file_content(file_id, text, char_count, extracted_at, extractor_version, error, embedded_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(file_id) DO UPDATE SET
+                        text=excluded.text, char_count=excluded.char_count,
+                        extracted_at=excluded.extracted_at,
+                        extractor_version=excluded.extractor_version, error=excluded.error,
+                        embedded_at=excluded.embedded_at
+                    """,
+                    (row["id"], text, len(text), now, extractor.EXTRACTOR_VERSION, error, embedded_at),
+                )
+                # テキストが変わった(可能性がある)ので古いチャンクは必ず破棄する
+                conn.execute("DELETE FROM file_chunks WHERE file_id=?", (row["id"],))
+            else:
+                # 埋め込みだけの追加処理ではtextをSET句に含めない。含めると
+                # file_content_auトリガーが発火し、内容が同じでも本文FTS索引の
+                # 削除・再構築が全対象ファイル分走ってしまう(Phase0で修正した
+                # ファイル名FTSと同種の性能問題)。
+                conn.execute(
+                    "UPDATE file_content SET embedded_at=? WHERE file_id=?",
+                    (embedded_at, row["id"]),
+                )
+            if chunk_rows is not None:
+                if not needs_reextract:
+                    conn.execute("DELETE FROM file_chunks WHERE file_id=?", (row["id"],))
+                conn.executemany(
+                    "INSERT INTO file_chunks(file_id, chunk_index, chunk_text, embedding) "
+                    "VALUES (?, ?, ?, ?)",
+                    chunk_rows,
+                )
+                _content_progress.embedded_count += 1
+            conn.commit()
 
             _content_progress.processed_count += 1
-            since_commit += 1
-            if since_commit >= CONTENT_COMMIT_EVERY:
-                conn.commit()
-                since_commit = 0
-        conn.commit()
     finally:
         conn.close()
