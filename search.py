@@ -195,6 +195,9 @@ def _make_snippet(text: str, around: int = SNIPPET_LEN) -> str:
     return snippet[: around * 2] + "…"
 
 
+SEMANTIC_SCAN_BATCH = 5000
+
+
 def semantic_search(
     conn: sqlite3.Connection,
     query_vec: np.ndarray,
@@ -204,32 +207,45 @@ def semantic_search(
 ) -> list[tuple[int, float, str]]:
     """埋め込み類似度でファイルを検索する(キーワードで既にヒットしたファイルは除外)。
 
+    数十万チャンク規模でもメモリを圧迫しないよう、埋め込みはバッチ単位で
+    読み出してスコア計算し、チャンク本文は上位ヒット分だけ後から取得する。
     戻り値は類似度降順の (file_id, スコア, 最も類似したチャンクの抜粋)。
     """
-    rows = conn.execute(
-        "SELECT fch.file_id, fch.chunk_text, fch.embedding FROM file_chunks fch "
+    cursor = conn.execute(
+        "SELECT fch.id, fch.file_id, fch.embedding FROM file_chunks fch "
         "JOIN files f ON f.id = fch.file_id WHERE f.is_deleted = 0"
-    ).fetchall()
-    if not rows:
+    )
+    best: dict[int, tuple[float, int]] = {}  # file_id -> (score, chunk_id)
+    while True:
+        rows = cursor.fetchmany(SEMANTIC_SCAN_BATCH)
+        if not rows:
+            break
+        vecs = np.frombuffer(
+            b"".join(row["embedding"] for row in rows), dtype=np.float32
+        ).reshape(len(rows), -1)
+        scores = vecs @ query_vec
+        for row, score in zip(rows, scores):
+            file_id = row["file_id"]
+            if file_id in exclude_ids:
+                continue
+            score = float(score)
+            if score >= min_score and (file_id not in best or score > best[file_id][0]):
+                best[file_id] = (score, row["id"])
+
+    ranked = sorted(best.items(), key=lambda kv: -kv[1][0])[:limit]
+    if not ranked:
         return []
-    vecs = np.stack([embedder.unpack_vector(row["embedding"]) for row in rows])
-    scores = vecs @ query_vec
 
-    best: dict[int, tuple[float, str]] = {}
-    for row, score in zip(rows, scores):
-        file_id = row["file_id"]
-        if file_id in exclude_ids:
-            continue
-        score = float(score)
-        if file_id not in best or score > best[file_id][0]:
-            best[file_id] = (score, row["chunk_text"])
-
-    ranked = sorted(best.items(), key=lambda kv: -kv[1][0])
+    chunk_ids = [chunk_id for _, (_, chunk_id) in ranked]
+    placeholders = ",".join("?" * len(chunk_ids))
+    text_rows = conn.execute(
+        f"SELECT id, chunk_text FROM file_chunks WHERE id IN ({placeholders})", chunk_ids
+    ).fetchall()
+    texts = {row["id"]: row["chunk_text"] for row in text_rows}
     return [
-        (file_id, score, _make_snippet(text))
-        for file_id, (score, text) in ranked
-        if score >= min_score
-    ][:limit]
+        (file_id, score, _make_snippet(texts.get(chunk_id, "")))
+        for file_id, (score, chunk_id) in ranked
+    ]
 
 
 def hybrid_search(
