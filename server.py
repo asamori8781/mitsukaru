@@ -252,7 +252,10 @@ def api_stats() -> dict:
         "content_indexed_count": content_indexed_count,
         "embedded_file_count": embedded_file_count,
         "last_content_index_at": cfg.phase1.last_content_index_at,
-        "semantic_search_available": _get_embedder() is not None,
+        # ここでモデルの実ロード(_get_embedder)をすると、設定画面を開くたびに
+        # 100MB級のONNXロードで数秒固まるため、ファイル存在チェックのみにする。
+        # 実際のロードは検索時に遅延して行われる。
+        "semantic_search_available": embedder.is_downloaded(config.MODELS_DIR),
     }
 
 
@@ -310,6 +313,7 @@ def _on_content_index_finished() -> None:
 def api_content_index_start() -> dict:
     started = indexer.start_content_index(
         config.DB_PATH, config.MODELS_DIR, on_finish=_on_content_index_finished,
+        error_log_path=config.LOGS_DIR / "content_index_errors.jsonl",
     )
     if not started:
         raise HTTPException(status_code=409, detail="既にコンテンツインデックスを作成中です。")

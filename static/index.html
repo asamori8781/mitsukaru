@@ -120,6 +120,7 @@
       <form id="search-form">
         <input id="search-input" type="text" placeholder="例: TSMのバックアップで詰まった時のメモ" autocomplete="off">
         <button id="btn-search" type="submit" class="primary">検索</button>
+        <button id="btn-search-cancel" type="button" class="secondary" hidden>キャンセル</button>
       </form>
       <p class="hero-hint">キーワードの羅列ではなく、覚えている内容をそのまま文章で入力できます</p>
       <p id="hero-stats" class="hero-stats"></p>
@@ -192,6 +193,7 @@
           <div id="content-index-progress-bar" class="progress-bar-fill"></div>
         </div>
         <p id="content-index-detail" class="hint"></p>
+        <p id="content-index-last-error" class="error-text" hidden></p>
         <button id="btn-content-index-cancel" class="secondary">キャンセル</button>
       </div>
     </div>

@@ -70,6 +70,9 @@ def download_model(
         tmp_dest.replace(dest)
 
 
+EMBED_BATCH_SIZE = 16
+
+
 class Embedder:
     """埋め込みモデルのロードと推論。ロードが重いためプロセス内で使い回すこと。"""
 
@@ -82,27 +85,49 @@ class Embedder:
         d = model_dir(models_root)
         self._tokenizer = Tokenizer.from_file(str(d / "tokenizer.json"))
         self._tokenizer.enable_truncation(max_length=MAX_SEQ_LEN)
-        self._tokenizer.enable_padding()
+        # パディングトークンはモデル系統により異なる(XLM-R系は<pad>、BERT系は[PAD])
+        pad_id = 0
+        pad_token = "[PAD]"
+        for candidate in ("<pad>", "[PAD]"):
+            token_id = self._tokenizer.token_to_id(candidate)
+            if token_id is not None:
+                pad_id, pad_token = token_id, candidate
+                break
+        self._tokenizer.enable_padding(pad_id=pad_id, pad_token=pad_token)
         self._session = ort.InferenceSession(
             str(d / "model.onnx"), providers=["CPUExecutionProvider"]
         )
+        # モデルによって必須入力が異なる(BERT系はtoken_type_idsも必須)ため、
+        # 実際のグラフ定義から入力名・出力名を取得して合わせる。
+        self._input_names = {inp.name for inp in self._session.get_inputs()}
+        output_names = [out.name for out in self._session.get_outputs()]
+        self._output_name = (
+            "last_hidden_state" if "last_hidden_state" in output_names else output_names[0]
+        )
 
     def _encode(self, texts: list[str]) -> np.ndarray:
-        encodings = self._tokenizer.encode_batch(texts)
-        input_ids = np.array([e.ids for e in encodings], dtype=np.int64)
-        attention_mask = np.array([e.attention_mask for e in encodings], dtype=np.int64)
-        outputs = self._session.run(
-            ["last_hidden_state"],
-            {"input_ids": input_ids, "attention_mask": attention_mask},
-        )
-        last_hidden_state = outputs[0]  # (batch, seq, hidden)
-        # attentionでマスクされた位置(パディング)を除いた平均プーリング
-        mask = attention_mask[:, :, None].astype(np.float32)
-        summed = (last_hidden_state * mask).sum(axis=1)
-        counts = np.clip(mask.sum(axis=1), 1e-9, None)
-        pooled = summed / counts
-        norms = np.clip(np.linalg.norm(pooled, axis=1, keepdims=True), 1e-9, None)
-        return (pooled / norms).astype(np.float32)
+        results = []
+        for start in range(0, len(texts), EMBED_BATCH_SIZE):
+            batch = texts[start:start + EMBED_BATCH_SIZE]
+            encodings = self._tokenizer.encode_batch(batch)
+            input_ids = np.array([e.ids for e in encodings], dtype=np.int64)
+            attention_mask = np.array([e.attention_mask for e in encodings], dtype=np.int64)
+            feed = {"input_ids": input_ids, "attention_mask": attention_mask}
+            if "token_type_ids" in self._input_names:
+                feed["token_type_ids"] = np.zeros_like(input_ids)
+            try:
+                outputs = self._session.run([self._output_name], feed)
+            except Exception as e:
+                raise EmbedderError(f"埋め込みモデルの推論に失敗しました: {e}") from e
+            last_hidden_state = outputs[0]  # (batch, seq, hidden)
+            # attentionでマスクされた位置(パディング)を除いた平均プーリング
+            mask = attention_mask[:, :, None].astype(np.float32)
+            summed = (last_hidden_state * mask).sum(axis=1)
+            counts = np.clip(mask.sum(axis=1), 1e-9, None)
+            pooled = summed / counts
+            norms = np.clip(np.linalg.norm(pooled, axis=1, keepdims=True), 1e-9, None)
+            results.append((pooled / norms).astype(np.float32))
+        return np.concatenate(results, axis=0)
 
     def embed_passages(self, texts: list[str]) -> np.ndarray:
         # e5系モデルの規約: 索引対象の文書側には "passage: " を付与する
