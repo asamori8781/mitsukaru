@@ -34,12 +34,33 @@ PDF_TEXT_RATIO = 0.10
 PHASE1_INDEX_MULTIPLIER = 2.5
 
 
+DRIVE_CHECK_TIMEOUT_SEC = 5
+
+
+def _path_exists_with_timeout(path: str, timeout_sec: float) -> bool:
+    """os.path.existsを見切りをつけて呼ぶ。
+
+    切断された共有フォルダにマップされたドライブレターは、存在確認だけで
+    Windowsのネットワークタイムアウト(数十秒)に達することがある。
+    daemonスレッド+join(timeout)で、応答のないドライブはスキップする。
+    """
+    result: dict = {}
+
+    def _worker() -> None:
+        result["exists"] = os.path.exists(path)
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join(timeout_sec)
+    return result.get("exists", False)
+
+
 def get_all_drives() -> list[str]:
     if platform.system() == "Windows":
         drives = []
         for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
             drive = f"{letter}:\\"
-            if os.path.exists(drive):
+            if _path_exists_with_timeout(drive, DRIVE_CHECK_TIMEOUT_SEC):
                 drives.append(drive)
         return drives
     # Windows以外(開発機での動作確認用)はルートを対象にする
@@ -201,6 +222,36 @@ def _flush_batch(conn, batch: list[tuple]) -> None:
     conn.commit()
 
 
+SCANDIR_TIMEOUT_SEC = 30
+
+
+def _scandir_with_timeout(path: str, timeout_sec: float = SCANDIR_TIMEOUT_SEC) -> tuple[list, Optional[Exception]]:
+    """os.scandirを見切りをつけて呼ぶ。
+
+    切断されたネットワーク共有や応答しない外付けドライブ配下のフォルダは、
+    列挙自体がOSレベルで長時間(数十秒〜)ブロックすることがある。全ドライブ
+    スキャンではこうしたパスに当たり得るため、daemonスレッド+join(timeout)で
+    見切りをつけ、1フォルダのハングでスキャン全体・キャンセル操作が止まる
+    ことを防ぐ(コンテンツインデックスの抽出タイムアウトと同じ方式)。
+    """
+    result: dict = {}
+
+    def _worker() -> None:
+        try:
+            result["entries"] = list(os.scandir(path))
+        except OSError as e:
+            result["error"] = e
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join(timeout_sec)
+    if t.is_alive():
+        return [], TimeoutError(f"{timeout_sec}秒以内に応答がありませんでした")
+    if "error" in result:
+        return [], result["error"]
+    return result.get("entries", []), None
+
+
 def _run_scan(
     roots: list[str],
     exclude_folders: set[str],
@@ -220,9 +271,8 @@ def _run_scan(
                     break
                 current = stack.pop()
                 _progress.current_folder = current
-                try:
-                    entries = list(os.scandir(current))
-                except (PermissionError, OSError):
+                entries, scandir_error = _scandir_with_timeout(current)
+                if scandir_error is not None:
                     _progress.error_count += 1
                     continue
                 for entry in entries:
