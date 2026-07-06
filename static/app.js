@@ -2,11 +2,14 @@
 
 // ---- 共通ユーティリティ ----
 
-async function api(path, method = "GET", body = null) {
+async function api(path, method = "GET", body = null, signal = null) {
   const opts = { method, headers: {} };
   if (body !== null) {
     opts.headers["Content-Type"] = "application/json";
     opts.body = JSON.stringify(body);
+  }
+  if (signal) {
+    opts.signal = signal;
   }
   const res = await fetch(path, opts);
   let data = null;
@@ -363,11 +366,14 @@ function wireScanEvents() {
 
 let lastSearchQuery = "";
 let searchInFlight = false;
+let searchAbortController = null;
 
 function setSearchBusy(message) {
   searchInFlight = true;
+  searchAbortController = new AbortController();
   document.getElementById("btn-search").disabled = true;
   document.getElementById("btn-research").disabled = true;
+  document.getElementById("btn-search-cancel").hidden = false;
   const info = document.getElementById("results-info");
   info.classList.remove("error");
   info.innerHTML = "";
@@ -379,8 +385,10 @@ function setSearchBusy(message) {
 
 function clearSearchBusy() {
   searchInFlight = false;
+  searchAbortController = null;
   document.getElementById("btn-search").disabled = false;
   document.getElementById("btn-research").disabled = false;
+  document.getElementById("btn-search-cancel").hidden = true;
 }
 
 function showSearchError(message) {
@@ -408,13 +416,25 @@ function wireSearchEvents() {
       ? "ローカル索引を検索しています..."
       : "AIでキーワードを展開し、ローカル索引を検索しています(APIの応答に十数秒かかることがあります)...");
     try {
-      const result = await api("/api/search", "POST", { query });
+      const result = await api("/api/search", "POST", { query }, searchAbortController.signal);
       renderSearchResult(result);
       schedulePendingLog(query, result.keywords.length, result.results.length);
     } catch (e) {
-      showSearchError(e.message);
+      if (e.name === "AbortError") {
+        const info = document.getElementById("results-info");
+        info.classList.remove("error");
+        info.textContent = "検索をキャンセルしました。";
+      } else {
+        showSearchError(e.message);
+      }
     } finally {
       clearSearchBusy();
+    }
+  });
+
+  document.getElementById("btn-search-cancel").addEventListener("click", () => {
+    if (searchAbortController) {
+      searchAbortController.abort();
     }
   });
 
@@ -436,11 +456,17 @@ function wireSearchEvents() {
     try {
       const result = await api("/api/search/local", "POST", {
         keywords, extensions, recency_days: recencyDays,
-      });
+      }, searchAbortController.signal);
       renderResultsTable(result.results);
       updatePendingLogHitCount(keywords.length, result.results.length);
     } catch (e) {
-      showSearchError(e.message);
+      if (e.name === "AbortError") {
+        const info = document.getElementById("results-info");
+        info.classList.remove("error");
+        info.textContent = "検索をキャンセルしました。";
+      } else {
+        showSearchError(e.message);
+      }
     } finally {
       clearSearchBusy();
     }
@@ -571,7 +597,19 @@ function renderResultsTable(results) {
 
 // ---- 設定画面 ----
 
+let settingsLoadInFlight = false;
+
 async function loadSettingsView() {
+  if (settingsLoadInFlight) return;
+  settingsLoadInFlight = true;
+  try {
+    await _loadSettingsViewInner();
+  } finally {
+    settingsLoadInFlight = false;
+  }
+}
+
+async function _loadSettingsViewInner() {
   const [scanSettings, aiConfig, stats] = await Promise.all([
     api("/api/settings"),
     api("/api/config"),
@@ -613,9 +651,13 @@ async function loadSettingsView() {
 }
 
 function wireSettingsEvents() {
-  document.getElementById("btn-nav-settings").addEventListener("click", async () => {
-    await loadSettingsView();
+  document.getElementById("btn-nav-settings").addEventListener("click", () => {
+    // 先に画面を切り替えてからデータを読み込む。読み込み完了をawaitしてから
+    // 切り替える方式だと、サーバーが重い時にボタンが無反応に見える上、
+    // 連打した回数分のshowViewが遅れて発火し、検索画面へ移動した後から
+    // 設定画面に引き戻される不具合になっていた。
     showView("view-settings");
+    loadSettingsView().catch((e) => showToast(e.message));
   });
 
   document.getElementById("btn-nav-search").addEventListener("click", () => {
@@ -726,6 +768,7 @@ const CONTENT_INDEX_PHASE_LABELS = {
 };
 
 let contentIndexPollTimer = null;
+let contentIndexPollActive = false;
 
 function wireContentIndexEvents() {
   document.getElementById("btn-content-index-start").addEventListener("click", async () => {
@@ -746,12 +789,17 @@ function wireContentIndexEvents() {
 }
 
 function pollContentIndexProgress() {
+  // 設定画面を開くたびに呼ばれても、ポーリングのループは常に1本だけにする
+  // (多重ループになるとリクエストが積み重なりサーバー・UIの両方が重くなる)
+  if (contentIndexPollActive) return;
+  contentIndexPollActive = true;
   clearTimeout(contentIndexPollTimer);
   const poll = async () => {
     let progress;
     try {
       progress = await api("/api/content-index/progress");
     } catch (e) {
+      contentIndexPollActive = false;
       return;
     }
     document.getElementById("content-index-phase-label").textContent =
@@ -760,21 +808,34 @@ function pollContentIndexProgress() {
     const pct = total > 0 ? Math.min(100, Math.round((progress.processed_count / total) * 100)) : 0;
     document.getElementById("content-index-progress-bar").style.width = pct + "%";
     document.getElementById("content-index-detail").textContent =
-      `${progress.processed_count} / ${total}件 (エラー: ${progress.error_count}件, 埋め込み: ${progress.embedded_count}件) `
+      `${progress.processed_count} / ${total}件 `
+      + `(エラー: ${progress.error_count}件 [抽出: ${progress.extract_error_count ?? "-"} / 埋め込み: ${progress.embed_error_count ?? "-"}], `
+      + `埋め込み済み: ${progress.embedded_count}件) `
       + (progress.current_file ? `現在: ${progress.current_file}` : "");
+
+    const lastErrorEl = document.getElementById("content-index-last-error");
+    if (progress.last_error) {
+      lastErrorEl.hidden = false;
+      lastErrorEl.textContent = `直近のエラー: ${progress.last_error}`;
+    } else {
+      lastErrorEl.hidden = true;
+    }
 
     if (progress.running) {
       contentIndexPollTimer = setTimeout(poll, 500);
       return;
     }
 
+    contentIndexPollActive = false;
     document.getElementById("btn-content-index-start").disabled = false;
     if (progress.error_message) {
       showToast(progress.error_message);
+    } else if (progress.error_count > 0) {
+      showToast(`コンテンツインデックスの作成が完了しました(エラー ${progress.error_count}件。詳細は logs/content_index_errors.jsonl を確認してください)。`);
     } else {
       showToast("コンテンツインデックスの作成が完了しました。");
     }
-    await loadSettingsView();
+    loadSettingsView().catch(() => {});
   };
   poll();
 }

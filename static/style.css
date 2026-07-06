@@ -391,6 +391,12 @@ button:disabled {
   color: var(--color-danger);
 }
 
+.error-text {
+  font-size: 0.8rem;
+  color: var(--color-danger);
+  word-break: break-all;
+}
+
 /* ---- コンテンツインデックス進捗 ---- */
 
 .content-index-progress {
