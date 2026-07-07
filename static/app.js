@@ -827,6 +827,11 @@ function pollContentIndexProgress() {
     }
 
     contentIndexPollActive = false;
+    // 統計(本文インデックス済み件数など)の再取得が終わる前にボタンを再度
+    // 有効化すると、「完了」に見える画面のまま古い(0件のままの)統計が
+    // 一瞬〜通信が遅い場合はしばらく表示され続けてしまう。再取得が終わって
+    // からボタンを有効化・完了トーストを出す。
+    await loadSettingsView().catch(() => {});
     document.getElementById("btn-content-index-start").disabled = false;
     if (progress.error_message) {
       showToast(progress.error_message);
@@ -835,7 +840,6 @@ function pollContentIndexProgress() {
     } else {
       showToast("コンテンツインデックスの作成が完了しました。");
     }
-    loadSettingsView().catch(() => {});
   };
   poll();
 }
