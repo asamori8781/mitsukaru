@@ -265,16 +265,30 @@ def _run_scan(
         for root in roots:
             if _progress.cancel_requested:
                 break
-            stack = [root]
+            # (パス, 深さ) で管理する。深さ0(root直下)だけタイムアウト保護付きの
+            # scandirを使う。ネットワークドライブ・マップ済み共有が切断・応答なしに
+            # なるリスクはroot(ドライブ文字/設定した対象フォルダそのもの)に集中する
+            # ため、そこだけ保護すれば実用上のハングはほぼ防げる。すべての階層で
+            # 保護すると、フォルダ1つごとにOSスレッドを生成することになり、
+            # 大規模スキャン(数十万フォルダ)ではスレッド生成コストの積み重ねだけで
+            # 顕著な遅延・失敗要因になり得るため、深い階層は素のscandirのままにする。
+            stack: list[tuple[str, int]] = [(root, 0)]
             while stack:
                 if _progress.cancel_requested:
                     break
-                current = stack.pop()
+                current, depth = stack.pop()
                 _progress.current_folder = current
-                entries, scandir_error = _scandir_with_timeout(current)
-                if scandir_error is not None:
-                    _progress.error_count += 1
-                    continue
+                if depth == 0:
+                    entries, scandir_error = _scandir_with_timeout(current)
+                    if scandir_error is not None:
+                        _progress.error_count += 1
+                        continue
+                else:
+                    try:
+                        entries = list(os.scandir(current))
+                    except (PermissionError, OSError):
+                        _progress.error_count += 1
+                        continue
                 for entry in entries:
                     if _progress.cancel_requested:
                         break
@@ -286,7 +300,7 @@ def _run_scan(
                                 continue
                             if _is_traversal_unsafe_dir(entry):
                                 continue
-                            stack.append(entry.path)
+                            stack.append((entry.path, depth + 1))
                         elif entry.is_file(follow_symlinks=False):
                             if _is_symlink_file(entry):
                                 continue
