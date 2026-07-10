@@ -403,6 +403,14 @@ def _extract_with_timeout(path: str, ext: str) -> tuple[str, Optional[str]]:
     return result.get("text", ""), None
 
 
+def extract_text_with_timeout(path: str, ext: str) -> tuple[str, Optional[str]]:
+    """単発のテキスト抽出(プレビュー等、インデックス処理以外からの利用向け)。
+
+    フリーズ保護付き。戻り値は (テキスト, エラーメッセージまたはNone)。
+    """
+    return _extract_with_timeout(path, ext)
+
+
 def _chunk_text(text: str) -> list[str]:
     text = text.strip()
     if not text:

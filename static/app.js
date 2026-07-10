@@ -563,6 +563,15 @@ function renderResultsTable(results) {
     const tdActions = document.createElement("td");
     tdActions.className = "actions";
 
+    const btnPreview = document.createElement("button");
+    btnPreview.type = "button";
+    btnPreview.className = "secondary";
+    btnPreview.textContent = "プレビュー";
+    btnPreview.addEventListener("click", () => {
+      showPreview(r);
+    });
+    tdActions.appendChild(btnPreview);
+
     const btnOpen = document.createElement("button");
     btnOpen.type = "button";
     btnOpen.className = "secondary";
@@ -592,6 +601,61 @@ function renderResultsTable(results) {
 
     tr.appendChild(tdActions);
     tbody.appendChild(tr);
+  });
+}
+
+// ---- ファイルプレビュー(Phase 2) ----
+
+let previewCurrentPath = null;
+
+async function showPreview(r) {
+  previewCurrentPath = r.path;
+  document.getElementById("preview-title").textContent = r.name;
+  document.getElementById("preview-path").textContent = r.path;
+  const textEl = document.getElementById("preview-text");
+  const metaEl = document.getElementById("preview-meta");
+  textEl.textContent = "読み込み中...";
+  metaEl.textContent = "";
+  document.getElementById("preview-truncated").hidden = true;
+  document.getElementById("modal-preview").hidden = false;
+  try {
+    const p = await api(`/api/preview/${r.id}`);
+    if (!p.available) {
+      textEl.textContent = p.reason;
+      return;
+    }
+    textEl.textContent = p.text || "(本文が空です)";
+    metaEl.textContent = `${p.char_count.toLocaleString()}文字`
+      + (p.source === "index" ? "(索引済みの本文)" : "(その場で読み取り)");
+    document.getElementById("preview-truncated").hidden = !p.truncated;
+  } catch (e) {
+    textEl.textContent = `プレビューを取得できませんでした: ${e.message}`;
+  }
+}
+
+function closePreview() {
+  document.getElementById("modal-preview").hidden = true;
+  previewCurrentPath = null;
+}
+
+function wirePreviewEvents() {
+  document.getElementById("btn-preview-close").addEventListener("click", closePreview);
+  document.getElementById("modal-preview").addEventListener("click", (ev) => {
+    if (ev.target === ev.currentTarget) closePreview(); // 背景クリックで閉じる
+  });
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape" && !document.getElementById("modal-preview").hidden) {
+      closePreview();
+    }
+  });
+  document.getElementById("btn-preview-open").addEventListener("click", async () => {
+    if (!previewCurrentPath) return;
+    try {
+      await api("/api/open-file", "POST", { path: previewCurrentPath });
+      markFileOpened();
+    } catch (e) {
+      showToast(e.message);
+    }
   });
 }
 
@@ -867,6 +931,7 @@ function wireEvents() {
   wireSearchEvents();
   wireSettingsEvents();
   wireContentIndexEvents();
+  wirePreviewEvents();
 }
 
 document.addEventListener("DOMContentLoaded", init);
