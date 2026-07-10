@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import platform
 import stat
@@ -17,6 +18,7 @@ from typing import Callable, Optional
 import db
 import embedder
 import extractor
+import vector_index
 
 BATCH_SIZE = 2000
 
@@ -345,6 +347,86 @@ def _phase1_ratio(ext: str) -> float:
     return 0.0
 
 
+# キャリブレーション対象とする拡張子ごとの最小サンプル数(少数の実測で
+# 極端な比率が全体に波及しないようにする)
+CALIBRATION_MIN_SAMPLES = 5
+# 再計算の条件: この件数以上処理した実行の直後、またはこの秒数より古い場合
+# (集計は本文全体の走査を伴うため、数件だけの増分実行では毎回やらない)
+CALIBRATION_REFRESH_MIN_FILES = 100
+CALIBRATION_REFRESH_AGE_SEC = 24 * 3600
+
+
+def _load_calibration(conn) -> Optional[dict]:
+    row = conn.execute("SELECT data FROM phase1_calibration WHERE id=1").fetchone()
+    if row is None:
+        return None
+    try:
+        return json.loads(row["data"])
+    except (ValueError, TypeError):
+        return None
+
+
+def _update_phase1_calibration(conn) -> None:
+    """抽出済みデータの実測値から予測サイズの補正係数を計算して保存する。
+
+    - 拡張子ごとの「元ファイルサイズ→抽出テキスト実バイト」比
+    - 「テキスト→FTS索引+チャンク+埋め込み」のオーバーヘッド比
+      (FTS5のシャドウテーブルfile_content_fts_dataの実サイズを使う)
+    """
+    rows = conn.execute(
+        """
+        SELECT f.ext AS ext, COUNT(*) AS n, SUM(f.size) AS src_bytes,
+               SUM(length(CAST(fc.text AS BLOB))) AS text_bytes
+        FROM file_content fc JOIN files f ON f.id = fc.file_id
+        WHERE fc.error IS NULL
+        GROUP BY f.ext
+        """
+    ).fetchall()
+    total_text = sum(row["text_bytes"] or 0 for row in rows)
+    if total_text <= 0:
+        return
+    text_ratio_by_ext = {
+        row["ext"]: (row["text_bytes"] or 0) / row["src_bytes"]
+        for row in rows
+        if (row["n"] or 0) >= CALIBRATION_MIN_SAMPLES and (row["src_bytes"] or 0) > 0
+    }
+    # オーバーヘッド比は、可能ならdbstat仮想テーブル(コンテンツ関連テーブル・
+    # インデックスが実際に占めるページサイズ)から求める。ページの空き・
+    # B-tree内部ノードまで含んだ実測になるため最も正確。dbstatが無効な
+    # ビルドでは、格納データ長の合計による近似にフォールバックする。
+    overhead_ratio = None
+    try:
+        content_disk = conn.execute(
+            "SELECT COALESCE(SUM(pgsize), 0) FROM dbstat WHERE name LIKE 'file_content%' "
+            "OR name LIKE '%file_chunks%' OR name LIKE 'vector_%'"
+        ).fetchone()[0]
+        if content_disk > total_text:
+            overhead_ratio = (content_disk - total_text) / total_text
+    except Exception:
+        pass
+    if overhead_ratio is None:
+        chunk_bytes = conn.execute(
+            "SELECT COALESCE(SUM(length(CAST(chunk_text AS BLOB)) + length(embedding)), 0) FROM file_chunks"
+        ).fetchone()[0]
+        try:
+            fts_bytes = conn.execute(
+                "SELECT COALESCE(SUM(length(block)), 0) FROM file_content_fts_data"
+            ).fetchone()[0]
+        except Exception:
+            fts_bytes = int(total_text * 1.5)  # シャドウテーブル構成が変わった場合の保守的な近似
+        overhead_ratio = (chunk_bytes + fts_bytes) / total_text
+    data = {
+        "text_ratio_by_ext": text_ratio_by_ext,
+        "overhead_ratio": overhead_ratio,
+    }
+    conn.execute(
+        "INSERT INTO phase1_calibration(id, computed_at, data) VALUES (1, ?, ?) "
+        "ON CONFLICT(id) DO UPDATE SET computed_at=excluded.computed_at, data=excluded.data",
+        (time.time(), json.dumps(data)),
+    )
+    conn.commit()
+
+
 def compute_summary(db_path: Path) -> dict:
     conn = db.get_connection(db_path)
     try:
@@ -352,10 +434,20 @@ def compute_summary(db_path: Path) -> dict:
         rows = conn.execute(
             "SELECT ext, SUM(size) FROM files WHERE is_deleted=0 GROUP BY ext"
         ).fetchall()
+        calibration = _load_calibration(conn)
     finally:
         conn.close()
-    text_bytes = sum((row[1] or 0) * _phase1_ratio(row[0]) for row in rows)
-    phase1_estimate_bytes = int(text_bytes * PHASE1_INDEX_MULTIPLIER)
+
+    # 実測キャリブレーションがあれば拡張子ごとの実測比率を優先し、
+    # 未実測の拡張子は従来の概算係数にフォールバックする
+    ratio_by_ext = (calibration or {}).get("text_ratio_by_ext", {})
+    text_bytes = sum(
+        (row[1] or 0) * ratio_by_ext.get(row[0], _phase1_ratio(row[0])) for row in rows
+    )
+    if calibration is not None and "overhead_ratio" in calibration:
+        phase1_estimate_bytes = int(text_bytes * (1 + calibration["overhead_ratio"]))
+    else:
+        phase1_estimate_bytes = int(text_bytes * PHASE1_INDEX_MULTIPLIER)
     db_size_bytes = db_path.stat().st_size if db_path.exists() else 0
     return {
         "file_count": total,
@@ -400,6 +492,14 @@ def _extract_with_timeout(path: str, ext: str) -> tuple[str, Optional[str]]:
     if "error" in result:
         return "", result["error"]
     return result.get("text", ""), None
+
+
+def extract_text_with_timeout(path: str, ext: str) -> tuple[str, Optional[str]]:
+    """単発のテキスト抽出(プレビュー等、インデックス処理以外からの利用向け)。
+
+    フリーズ保護付き。戻り値は (テキスト, エラーメッセージまたはNone)。
+    """
+    return _extract_with_timeout(path, ext)
 
 
 def _chunk_text(text: str) -> list[str]:
@@ -602,11 +702,9 @@ def _run_content_index(
             list(extractable),
         ).fetchall()
         _content_progress.total_count = len(rows)
-        if not rows:
-            return
 
         embedder_instance: Optional[embedder.Embedder] = None
-        if model_ready:
+        if rows and model_ready:
             try:
                 embedder_instance = embedder.Embedder(models_root)
             except Exception as e:
@@ -615,6 +713,11 @@ def _run_content_index(
                 _content_progress.error_message = (
                     f"埋め込みモデルを利用できないため、全文検索のみ有効にします({e})"
                 )
+
+        # 新規チャンクは(構築済みなら)その場で既存クラスタへ割り当てる。
+        # 未割当のままでも検索漏れはないが、割り当てておくと検索が速いまま保たれ、
+        # 未割当率の増加による再構築の頻度も抑えられる。
+        centroids = vector_index.load_centroids(conn) if embedder_instance is not None else None
 
         for row in rows:
             if _content_progress.cancel_requested:
@@ -653,8 +756,9 @@ def _run_content_index(
                     chunks = _chunk_text(text)
                     try:
                         vecs = embedder_instance.embed_passages(chunks)
+                        cluster_ids = vector_index.assign_clusters(centroids, vecs)
                         chunk_rows = [
-                            (row["id"], i, chunk, embedder.pack_vector(vecs[i]))
+                            (row["id"], i, chunk, embedder.pack_vector(vecs[i]), cluster_ids[i])
                             for i, chunk in enumerate(chunks)
                         ]
                     except Exception as e:
@@ -693,13 +797,50 @@ def _run_content_index(
                 if not needs_reextract:
                     conn.execute("DELETE FROM file_chunks WHERE file_id=?", (row["id"],))
                 conn.executemany(
-                    "INSERT INTO file_chunks(file_id, chunk_index, chunk_text, embedding) "
-                    "VALUES (?, ?, ?, ?)",
+                    "INSERT INTO file_chunks(file_id, chunk_index, chunk_text, embedding, cluster_id) "
+                    "VALUES (?, ?, ?, ?, ?)",
                     chunk_rows,
                 )
                 _content_progress.embedded_count += 1
             conn.commit()
 
             _content_progress.processed_count += 1
+
+        # ループ後(処理0件でも): 意味検索の高速化インデックス(IVF)の構築・再構築。
+        # チャンク数が閾値未満・既存インデックスが十分新しい場合は何もしないため、
+        # 差分スキャン後の自動実行で毎回呼ばれても負荷はほぼない。
+        if not _content_progress.cancel_requested and vector_index.needs_rebuild(conn):
+            _content_progress.phase = "building_vector_index"
+            _content_progress.current_file = ""
+            _content_progress.processed_count = 0
+            _content_progress.total_count = 0
+
+            def _vi_progress(done: int, total: int) -> None:
+                _content_progress.processed_count = done
+                _content_progress.total_count = total
+
+            vector_index.build(
+                conn,
+                cancel_check=lambda: _content_progress.cancel_requested,
+                progress_cb=_vi_progress,
+            )
+
+        # 予測サイズの実測キャリブレーション更新。本文全体の集計を伴うため、
+        # 未計算のとき・まとまった件数を処理した直後・十分古いときだけ行う
+        if not _content_progress.cancel_requested:
+            row = conn.execute("SELECT computed_at FROM phase1_calibration WHERE id=1").fetchone()
+            should_update = (
+                row is None
+                or _content_progress.processed_count >= CALIBRATION_REFRESH_MIN_FILES
+                or (_content_progress.processed_count > 0
+                    and time.time() - row["computed_at"] > CALIBRATION_REFRESH_AGE_SEC)
+            )
+            if should_update:
+                try:
+                    _update_phase1_calibration(conn)
+                except Exception as e:
+                    # 予測の補正は補助機能のため、失敗してもインデックス作成自体は
+                    # 成功扱いとする(原因調査のためログには残す)
+                    _log_content_error(error_log_path, "calibration", str(db_path), str(e))
     finally:
         conn.close()

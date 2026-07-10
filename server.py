@@ -20,6 +20,7 @@ import ai_client
 import config
 import db
 import embedder
+import extractor
 import indexer
 import search
 
@@ -441,6 +442,71 @@ def api_search_local(body: LocalSearchIn) -> dict:
         conn.close()
 
     return {"results": [dataclasses.asdict(r) for r in results]}
+
+
+# ---- ファイルプレビュー(Phase 2) ----
+
+PREVIEW_MAX_CHARS = 4000
+
+
+@app.get("/api/preview/{file_id}")
+def api_preview(file_id: int) -> dict:
+    """検索結果からファイルを開かずに本文の先頭を確認するためのプレビュー。
+
+    コンテンツインデックス済みの本文(ファイルが未更新のもの)があれば再利用し、
+    なければその場で抽出する(読み取り専用。DBへは書き込まず、並行する
+    コンテンツインデックス作成と競合しない)。対象はDBに索引済みのファイルのみ
+    (パスを直接受け取らないため、任意ファイルの読み出しはできない)。
+    """
+    conn = db.get_connection(config.DB_PATH)
+    try:
+        f = conn.execute(
+            "SELECT id, name, path, ext, mtime FROM files WHERE id=? AND is_deleted=0",
+            (file_id,),
+        ).fetchone()
+        if f is None:
+            raise HTTPException(status_code=404, detail="ファイルが索引に見つかりません。")
+        fc = conn.execute(
+            "SELECT text, extracted_at, error FROM file_content WHERE file_id=?",
+            (file_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    base = {"name": f["name"], "path": f["path"]}
+
+    def _ok(text: str, source: str) -> dict:
+        return {
+            **base,
+            "available": True,
+            "text": text[:PREVIEW_MAX_CHARS],
+            "truncated": len(text) > PREVIEW_MAX_CHARS,
+            "char_count": len(text),
+            "source": source,
+        }
+
+    # 索引済みの本文が新しければそのまま使う(即応答)。比較はDBに記録した
+    # mtime(前回スキャン時点)ではなくディスク上の現在のmtimeと行う。
+    # スキャン前に更新されたファイルで古い本文を見せないため。
+    if fc is not None and fc["error"] is None:
+        try:
+            disk_mtime = os.path.getmtime(f["path"])
+        except OSError:
+            disk_mtime = None  # 消えた/読めないファイルは索引済み本文をそのまま見せる
+        if disk_mtime is None or fc["extracted_at"] >= disk_mtime:
+            return _ok(fc["text"], "index")
+
+    # 未抽出・ファイル更新済みの場合はその場で読み取る
+    if f["ext"] not in extractor.extractable_extensions():
+        return {**base, "available": False,
+                "reason": "この形式のプレビューには対応していません(対応: テキスト系 / .pdf / .docx / .xlsx / .pptx)。"}
+    if not os.path.exists(f["path"]):
+        return {**base, "available": False,
+                "reason": "ファイルが見つかりません(移動または削除された可能性があります)。"}
+    text, error = indexer.extract_text_with_timeout(f["path"], f["ext"])
+    if error:
+        return {**base, "available": False, "reason": f"本文を読み取れませんでした: {error}"}
+    return _ok(text, "live")
 
 
 # ---- ファイル操作系エンドポイント ----

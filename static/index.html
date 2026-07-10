@@ -267,6 +267,20 @@
 
 </main>
 
+<div id="modal-preview" class="modal-overlay" hidden>
+  <div class="modal modal-wide">
+    <h3 id="preview-title"></h3>
+    <p id="preview-path" class="hint"></p>
+    <pre id="preview-text" class="preview-text"></pre>
+    <p id="preview-truncated" class="hint" hidden>長い本文のため先頭のみ表示しています。全文は「ファイルを開く」で確認してください。</p>
+    <div class="modal-actions preview-actions">
+      <span id="preview-meta" class="hint"></span>
+      <button id="btn-preview-open" type="button" class="secondary">ファイルを開く</button>
+      <button id="btn-preview-close" type="button" class="primary">閉じる</button>
+    </div>
+  </div>
+</div>
+
 <div id="toast" class="toast" hidden></div>
 
 <script src="/static/app.js"></script>

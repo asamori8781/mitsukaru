@@ -85,16 +85,46 @@ END;
 
 -- Phase 1: チャンク分割した本文と埋め込みベクトル(files 1:N)。
 -- embeddingはfloat32配列をnumpy.tobytes()でパックしたBLOB。
+-- cluster_idはPhase 2の意味検索高速化(IVF)用。所属クラスタ(vector_centroidsの
+-- cluster_id)を指す。NULLは未割当を意味し、検索時は常に走査対象に含まれるため
+-- 未割当でも検索漏れは起きない(速度が総当たり相当に落ちるだけ)。
 CREATE TABLE IF NOT EXISTS file_chunks (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     file_id     INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
     chunk_index INTEGER NOT NULL,
     chunk_text  TEXT NOT NULL,
     embedding   BLOB NOT NULL,
+    cluster_id  INTEGER,
     UNIQUE(file_id, chunk_index)
 );
 
 CREATE INDEX IF NOT EXISTS idx_file_chunks_file_id ON file_chunks(file_id);
+
+-- Phase 2: 意味検索高速化(IVF)のクラスタ中心。centroidはembeddingと同じ
+-- float32パックBLOB。vector_index_metaが存在する場合のみインデックスは有効
+-- (再構築中はmetaを消してから組み直すことで、中途半端な状態が使われない)。
+CREATE TABLE IF NOT EXISTS vector_centroids (
+    cluster_id INTEGER PRIMARY KEY,
+    centroid   BLOB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS vector_index_meta (
+    id                  INTEGER PRIMARY KEY CHECK (id = 1),
+    dim                 INTEGER NOT NULL,
+    built_at            REAL NOT NULL,
+    indexed_chunk_count INTEGER NOT NULL
+);
+
+-- Phase 2: Phase 1予測サイズの実測キャリブレーション(1行のみ)。
+-- コンテンツインデックス作成の最後に、抽出済みデータの実測値
+-- (拡張子ごとの抽出率、FTS索引・チャンク・埋め込みのオーバーヘッド)を
+-- JSONで保存し、予測サイズ算出に利用する。集計は本文全体の走査を伴い
+-- 重いため、統計表示のたびではなくインデックス作成時に1回だけ行う。
+CREATE TABLE IF NOT EXISTS phase1_calibration (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    computed_at REAL NOT NULL,
+    data        TEXT NOT NULL
+);
 """
 
 # 旧バージョンのDB(無条件AFTER UPDATEトリガー)を新定義へ移行するためのSQL。
@@ -141,6 +171,11 @@ def _migrate_columns(conn: sqlite3.Connection) -> None:
     # SQLiteに「ALTER TABLE ADD COLUMN IF NOT EXISTS」はないため存在確認してから追加する。
     if not _column_exists(conn, "file_content", "embedded_at"):
         conn.execute("ALTER TABLE file_content ADD COLUMN embedded_at REAL")
+    if not _column_exists(conn, "file_chunks", "cluster_id"):
+        conn.execute("ALTER TABLE file_chunks ADD COLUMN cluster_id INTEGER")
+    # cluster_idはSCHEMA_SQL適用時点で列が無い既存DBがあるため、インデックスは
+    # 列の存在を保証したここで作成する(IF NOT EXISTSで冪等)。
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_file_chunks_cluster ON file_chunks(cluster_id)")
 
 
 def init_schema(db_path: Path) -> None:
