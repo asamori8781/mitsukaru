@@ -114,6 +114,17 @@ CREATE TABLE IF NOT EXISTS vector_index_meta (
     built_at            REAL NOT NULL,
     indexed_chunk_count INTEGER NOT NULL
 );
+
+-- Phase 2: Phase 1予測サイズの実測キャリブレーション(1行のみ)。
+-- コンテンツインデックス作成の最後に、抽出済みデータの実測値
+-- (拡張子ごとの抽出率、FTS索引・チャンク・埋め込みのオーバーヘッド)を
+-- JSONで保存し、予測サイズ算出に利用する。集計は本文全体の走査を伴い
+-- 重いため、統計表示のたびではなくインデックス作成時に1回だけ行う。
+CREATE TABLE IF NOT EXISTS phase1_calibration (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    computed_at REAL NOT NULL,
+    data        TEXT NOT NULL
+);
 """
 
 # 旧バージョンのDB(無条件AFTER UPDATEトリガー)を新定義へ移行するためのSQL。

@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import platform
 import stat
@@ -346,6 +347,86 @@ def _phase1_ratio(ext: str) -> float:
     return 0.0
 
 
+# キャリブレーション対象とする拡張子ごとの最小サンプル数(少数の実測で
+# 極端な比率が全体に波及しないようにする)
+CALIBRATION_MIN_SAMPLES = 5
+# 再計算の条件: この件数以上処理した実行の直後、またはこの秒数より古い場合
+# (集計は本文全体の走査を伴うため、数件だけの増分実行では毎回やらない)
+CALIBRATION_REFRESH_MIN_FILES = 100
+CALIBRATION_REFRESH_AGE_SEC = 24 * 3600
+
+
+def _load_calibration(conn) -> Optional[dict]:
+    row = conn.execute("SELECT data FROM phase1_calibration WHERE id=1").fetchone()
+    if row is None:
+        return None
+    try:
+        return json.loads(row["data"])
+    except (ValueError, TypeError):
+        return None
+
+
+def _update_phase1_calibration(conn) -> None:
+    """抽出済みデータの実測値から予測サイズの補正係数を計算して保存する。
+
+    - 拡張子ごとの「元ファイルサイズ→抽出テキスト実バイト」比
+    - 「テキスト→FTS索引+チャンク+埋め込み」のオーバーヘッド比
+      (FTS5のシャドウテーブルfile_content_fts_dataの実サイズを使う)
+    """
+    rows = conn.execute(
+        """
+        SELECT f.ext AS ext, COUNT(*) AS n, SUM(f.size) AS src_bytes,
+               SUM(length(CAST(fc.text AS BLOB))) AS text_bytes
+        FROM file_content fc JOIN files f ON f.id = fc.file_id
+        WHERE fc.error IS NULL
+        GROUP BY f.ext
+        """
+    ).fetchall()
+    total_text = sum(row["text_bytes"] or 0 for row in rows)
+    if total_text <= 0:
+        return
+    text_ratio_by_ext = {
+        row["ext"]: (row["text_bytes"] or 0) / row["src_bytes"]
+        for row in rows
+        if (row["n"] or 0) >= CALIBRATION_MIN_SAMPLES and (row["src_bytes"] or 0) > 0
+    }
+    # オーバーヘッド比は、可能ならdbstat仮想テーブル(コンテンツ関連テーブル・
+    # インデックスが実際に占めるページサイズ)から求める。ページの空き・
+    # B-tree内部ノードまで含んだ実測になるため最も正確。dbstatが無効な
+    # ビルドでは、格納データ長の合計による近似にフォールバックする。
+    overhead_ratio = None
+    try:
+        content_disk = conn.execute(
+            "SELECT COALESCE(SUM(pgsize), 0) FROM dbstat WHERE name LIKE 'file_content%' "
+            "OR name LIKE '%file_chunks%' OR name LIKE 'vector_%'"
+        ).fetchone()[0]
+        if content_disk > total_text:
+            overhead_ratio = (content_disk - total_text) / total_text
+    except Exception:
+        pass
+    if overhead_ratio is None:
+        chunk_bytes = conn.execute(
+            "SELECT COALESCE(SUM(length(CAST(chunk_text AS BLOB)) + length(embedding)), 0) FROM file_chunks"
+        ).fetchone()[0]
+        try:
+            fts_bytes = conn.execute(
+                "SELECT COALESCE(SUM(length(block)), 0) FROM file_content_fts_data"
+            ).fetchone()[0]
+        except Exception:
+            fts_bytes = int(total_text * 1.5)  # シャドウテーブル構成が変わった場合の保守的な近似
+        overhead_ratio = (chunk_bytes + fts_bytes) / total_text
+    data = {
+        "text_ratio_by_ext": text_ratio_by_ext,
+        "overhead_ratio": overhead_ratio,
+    }
+    conn.execute(
+        "INSERT INTO phase1_calibration(id, computed_at, data) VALUES (1, ?, ?) "
+        "ON CONFLICT(id) DO UPDATE SET computed_at=excluded.computed_at, data=excluded.data",
+        (time.time(), json.dumps(data)),
+    )
+    conn.commit()
+
+
 def compute_summary(db_path: Path) -> dict:
     conn = db.get_connection(db_path)
     try:
@@ -353,10 +434,20 @@ def compute_summary(db_path: Path) -> dict:
         rows = conn.execute(
             "SELECT ext, SUM(size) FROM files WHERE is_deleted=0 GROUP BY ext"
         ).fetchall()
+        calibration = _load_calibration(conn)
     finally:
         conn.close()
-    text_bytes = sum((row[1] or 0) * _phase1_ratio(row[0]) for row in rows)
-    phase1_estimate_bytes = int(text_bytes * PHASE1_INDEX_MULTIPLIER)
+
+    # 実測キャリブレーションがあれば拡張子ごとの実測比率を優先し、
+    # 未実測の拡張子は従来の概算係数にフォールバックする
+    ratio_by_ext = (calibration or {}).get("text_ratio_by_ext", {})
+    text_bytes = sum(
+        (row[1] or 0) * ratio_by_ext.get(row[0], _phase1_ratio(row[0])) for row in rows
+    )
+    if calibration is not None and "overhead_ratio" in calibration:
+        phase1_estimate_bytes = int(text_bytes * (1 + calibration["overhead_ratio"]))
+    else:
+        phase1_estimate_bytes = int(text_bytes * PHASE1_INDEX_MULTIPLIER)
     db_size_bytes = db_path.stat().st_size if db_path.exists() else 0
     return {
         "file_count": total,
@@ -733,5 +824,23 @@ def _run_content_index(
                 cancel_check=lambda: _content_progress.cancel_requested,
                 progress_cb=_vi_progress,
             )
+
+        # 予測サイズの実測キャリブレーション更新。本文全体の集計を伴うため、
+        # 未計算のとき・まとまった件数を処理した直後・十分古いときだけ行う
+        if not _content_progress.cancel_requested:
+            row = conn.execute("SELECT computed_at FROM phase1_calibration WHERE id=1").fetchone()
+            should_update = (
+                row is None
+                or _content_progress.processed_count >= CALIBRATION_REFRESH_MIN_FILES
+                or (_content_progress.processed_count > 0
+                    and time.time() - row["computed_at"] > CALIBRATION_REFRESH_AGE_SEC)
+            )
+            if should_update:
+                try:
+                    _update_phase1_calibration(conn)
+                except Exception as e:
+                    # 予測の補正は補助機能のため、失敗してもインデックス作成自体は
+                    # 成功扱いとする(原因調査のためログには残す)
+                    _log_content_error(error_log_path, "calibration", str(db_path), str(e))
     finally:
         conn.close()
