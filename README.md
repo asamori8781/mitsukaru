@@ -104,6 +104,26 @@ pyinstaller mitsukaru.spec
 - Windowsではpywebviewの既定バックエンド(WebView2)を利用するため、WebView2 Runtime
   (Windows 10/11には標準搭載されていることが多い)が必要です。
 
+### なぜ単一exe(onefile)ではなくonedirなのか
+
+PyInstallerにはビルド成果物を単一のexeファイルにまとめる`onefile`形式もありますが、
+本プロジェクトでは意図的に`onedir`(exe + `_internal`フォルダ)を採用しています。
+
+- `onefile`は**起動するたびに毎回**、一時フォルダ(Windowsでは`%TEMP%`配下)へ全内容を
+  展開し、終了時に削除する仕組みです。「初回だけ展開して2回目以降は速くなる」機能では
+  なく、2回目以降の起動も毎回展開コストがかかり続けます
+- `onedir`はビルド時に1回展開済みの状態で配布されるため、`dist/mitsukaru/`フォルダを
+  設置した後は展開処理が一切発生せず、常に高速起動します
+- `data/`・`logs/`(APIキー設定・DB・埋め込みモデル・ログ)は`mitsukaru.exe`の実際の
+  設置場所を基準に生成されます。これはonefile/onedirどちらでも同じ挙動で、
+  (onefileの)一時展開フォルダとは無関係です
+
+### 配布方法(1ファイルでやり取りしたい場合)
+
+`dist/mitsukaru/`フォルダを丸ごとZIP圧縮して配布してください。利用者は1回だけ展開
+(解凍)し、以降は展開後のフォルダ内にある`mitsukaru.exe`を直接ダブルクリックするだけで
+毎回高速に起動します。追加のインストーラー作成ツールは不要です。
+
 ## APIキーの取り扱いに関する注意
 
 - `data/config.json` にAPIキーを**平文で保存**します。`.gitignore` で `data/` を
