@@ -69,26 +69,38 @@ python main.py
 一度作成した後は、差分スキャン完了のたびに変更されたファイルだけが自動で追加処理されます
 (設定画面のチェックボックスで無効化できます)。
 
-## PyInstallerでのビルド手順(onedir)
+## PyInstallerでのビルド手順(onedir、スタンドアロン化)
+
+Python未インストールの環境でも動く単一フォルダの配布物(exe+依存一式)を作れます。
+ビルド設定は `mitsukaru.spec` に版管理済みなので、コマンド一発でビルドできます。
 
 ```bash
+pip install -r requirements.txt
 pip install pyinstaller
-pyinstaller --name mitsukaru --onedir --windowed --icon assets/icon.ico --add-data "static;static" main.py
+pyinstaller mitsukaru.spec
 ```
 
-- macOS/Linuxでビルドする場合は `--add-data "static:static"`(区切り文字が `:`)にしてください。
-- `--icon assets/icon.ico` によりexeとウィンドウのタイトルバー・タスクバーにミツカルのロゴが
-  表示されます。開発中の `python main.py` 実行ではWindowsの仕様上Pythonの既定アイコンが
-  表示されますが、ビルド後は専用ロゴになります。
-- 生成物は `dist/mitsukaru/` 配下に展開されます。`data/` と `logs/` は実行ファイルと同階層に
-  自動生成されるため、フォルダごとコピーすればポータブルに動作します。
-- **想定サイズ目安**: FastAPI/Starlette/Uvicorn/pywebview/requests一式とPythonランタイムのみなら
-  onedir全体でおおよそ数十〜100MB程度ですが、Phase 1の抽出ライブラリ(pypdf/python-docx/
-  openpyxl/python-pptx、いずれも純Python)と埋め込み計算用のnumpy/onnxruntime/tokenizersが
-  加わるため、実際にはプラス100〜150MB程度(合計200〜300MB程度)を見込んでください
-  (pandasは引き続き未使用)。埋め込みモデル本体(約100MB)はビルドに含めず`data/models/`へ
-  実行時ダウンロードするため、配布物自体のサイズには含まれません。実測値は開発機での
-  ビルド後に確認してください。
+- 生成物は `dist/mitsukaru/` 配下に展開されます(onedir形式)。`dist/mitsukaru/` フォルダ
+  ごとコピーすればポータブルに動作します。`data/` と `logs/` は `mitsukaru.exe` と同階層に
+  実行時生成されます(埋め込みモデルは同梱せず、初回のコンテンツインデックス作成時に
+  `data/models/` へ約100MBを自動ダウンロードするため、配布物自体には含まれません)。
+- `mitsukaru.spec` は `onnxruntime` / `tokenizers`(ネイティブ拡張を含む)を
+  `collect_all` で明示的に同梱し、`pandas` が誤って含まれていないことをビルド時にも
+  検証します。アイコン(`assets/icon.ico`)はexeとウィンドウのタイトルバー・タスクバーに
+  適用されます(開発中の `python main.py` 実行ではWindowsの仕様上Pythonの既定アイコンに
+  なりますが、ビルド後は専用ロゴになります)。
+- **実測サイズ**: 開発機(Linux)でのビルドで onedir 全体 **約216MB**(FastAPI/Starlette/
+  Uvicorn/pywebview/requests一式+Phase 1の抽出ライブラリ〔pypdf/python-docx/openpyxl/
+  python-pptx、いずれも純Python〕+numpy/onnxruntime/tokenizers、pandasは未使用)。
+  Windows版は依存ライブラリの構成が近いため概ね同程度を見込めますが、実測値は
+  実際のビルド後に確認してください。
+- ビルド後の動作確認として、フリーズしたPythonランタイム上でFastAPIサーバーが正しく
+  起動し `/api/status` に応答すること(=numpy/onnxruntime/tokenizers等の依存が
+  正しく同梱され、DBスキーマ初期化を含む起動シーケンス全体が動くこと)を開発機
+  (Linux)で確認済みです。pywebviewのウィンドウ表示自体はOS依存の別レイヤーのため、
+  実際の画面表示はWindows実機での確認が必要です。
+- macOS/Linuxでビルドする場合、spec内の`--add-data`相当の記述は区切り文字を意識せず
+  そのまま使えます(PyInstallerのspec形式はOS間の区切り文字差異を自動吸収します)。
 - Windowsではpywebviewの既定バックエンド(WebView2)を利用するため、WebView2 Runtime
   (Windows 10/11には標準搭載されていることが多い)が必要です。
 

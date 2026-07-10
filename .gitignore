@@ -4,5 +4,9 @@ venv/
 dist/
 build/
 __pycache__/
-*.spec
 .env
+
+# mitsukaru.spec(PyInstallerビルド設定)はビルド再現性のため版管理する。
+# 他の.specファイル(pyi-makespecの試し生成物等)は引き続き無視する。
+*.spec
+!/mitsukaru.spec
