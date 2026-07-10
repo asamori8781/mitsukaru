@@ -5,9 +5,16 @@
 #   pip install -r requirements.txt pyinstaller
 #   pyinstaller mitsukaru.spec
 #
-# 生成物は dist/mitsukaru/ 配下(onedir)。data/ と logs/ は実行ファイルと
-# 同階層に実行時生成されるため、dist/mitsukaru/ ごとコピーすればポータブルに
-# 動作する(埋め込みモデルは同梱せず初回起動時にdata/models/へダウンロード)。
+# 生成物は dist/mitsukaru/ 配下(onedir: mitsukaru.exe + _internalフォルダ)。
+# onefile(単一exe)ではなくonedirを採用しているのは、onefileは起動のたびに
+# 一時フォルダへ全内容を展開し終了時に削除する仕様のため、2回目以降の起動も
+# 毎回展開コストがかかり続けるため(「初回だけ展開して以降は速くなる」機能
+# ではない)。onedirはビルド時に1回展開済みの状態で配布されるため、
+# dist/mitsukaru/ フォルダを配置した後は毎回の展開なしで常に高速起動する。
+# data/ と logs/ は実行ファイルと同階層に実行時生成されるため、
+# dist/mitsukaru/ フォルダごと配置すればポータブルに動作する(埋め込み
+# モデルは同梱せず初回のコンテンツインデックス作成時にdata/models/へ
+# ダウンロード)。
 from PyInstaller.utils.hooks import collect_all
 
 block_cipher = None
