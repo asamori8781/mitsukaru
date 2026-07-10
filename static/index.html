@@ -187,6 +187,10 @@
       <p>意味検索: <span id="stats-semantic-available">-</span></p>
       <p>最終インデックス作成: <span id="stats-last-content-index">-</span></p>
       <button id="btn-content-index-start" class="primary">コンテンツインデックスを作成・更新</button>
+      <label class="checkbox-row">
+        <input type="checkbox" id="content-index-auto">
+        スキャン後に自動で差分更新する(初回作成後から有効。変更されたファイルだけを処理します)
+      </label>
       <div id="content-index-progress" class="content-index-progress" hidden>
         <p id="content-index-phase-label"></p>
         <div class="progress-bar-track">

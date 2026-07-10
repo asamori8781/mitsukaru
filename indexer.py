@@ -93,6 +93,7 @@ class ScanProgress:
             "current_folder": self.current_folder,
             "processed_count": self.processed_count,
             "error_count": self.error_count,
+            "cancel_requested": self.cancel_requested,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "summary": self.summary,
@@ -477,12 +478,21 @@ def start_content_index(
     models_root: Path,
     on_finish: Optional[Callable[[], None]] = None,
     error_log_path: Optional[Path] = None,
+    allow_model_download: bool = True,
 ) -> bool:
+    """コンテンツインデックス作成をバックグラウンドで開始する。
+
+    allow_model_download=False(スキャン後の自動増分更新)では、埋め込みモデルが
+    未ダウンロードでもダウンロードを試みない。オフライン・プロキシ環境で差分
+    スキャンのたびにネットワーク待ちが発生するのを避けるためで、その場合は
+    全文検索のみの縮退運転になる(埋め込みは後の手動実行時に追加される)。
+    """
     with _content_start_lock:
         if _content_progress.running:
             return False
         _content_progress.running = True
-        _content_progress.phase = "downloading_model" if not embedder.is_downloaded(models_root) else "indexing"
+        needs_download = allow_model_download and not embedder.is_downloaded(models_root)
+        _content_progress.phase = "downloading_model" if needs_download else "indexing"
         _content_progress.current_file = ""
         _content_progress.processed_count = 0
         _content_progress.total_count = 0
@@ -501,7 +511,7 @@ def start_content_index(
 
     def _target() -> None:
         try:
-            _run_content_index(db_path, models_root, error_log_path)
+            _run_content_index(db_path, models_root, error_log_path, allow_model_download)
         except Exception as e:  # 予期しない例外もUIへ伝える
             _content_progress.error_message = f"コンテンツインデックス作成中に予期しないエラーが発生しました: {e}"
         finally:
@@ -537,31 +547,42 @@ def _log_content_error(error_log_path: Optional[Path], kind: str, path: str, mes
         pass
 
 
-def _run_content_index(db_path: Path, models_root: Path, error_log_path: Optional[Path] = None) -> None:
-    embedder_instance: Optional[embedder.Embedder] = None
-    try:
-        if not embedder.is_downloaded(models_root):
-            _content_progress.phase = "downloading_model"
+def _run_content_index(
+    db_path: Path,
+    models_root: Path,
+    error_log_path: Optional[Path] = None,
+    allow_model_download: bool = True,
+) -> None:
+    if allow_model_download and not embedder.is_downloaded(models_root):
+        _content_progress.phase = "downloading_model"
 
-            def _on_dl_progress(name: str, downloaded: int, total: int) -> None:
-                _content_progress.current_file = f"モデルをダウンロード中: {name}"
-                _content_progress.processed_count = downloaded
-                _content_progress.total_count = total
+        def _on_dl_progress(name: str, downloaded: int, total: int) -> None:
+            _content_progress.current_file = f"モデルをダウンロード中: {name}"
+            _content_progress.processed_count = downloaded
+            _content_progress.total_count = total
 
+        try:
             embedder.download_model(models_root, on_progress=_on_dl_progress)
-        embedder_instance = embedder.Embedder(models_root)
-    except Exception as e:
-        # 埋め込みが使えなくても全文抽出+ファイル名検索の強化(FTS)自体は続行する(縮退運転)。
-        # onnxruntime/tokenizersが投げうる例外はEmbedderError以外もあり得るため広く捕捉する。
-        _content_progress.embedder_available = False
-        _content_progress.error_message = (
-            f"埋め込みモデルを利用できないため、全文検索のみ有効にします({e})"
-        )
+        except Exception as e:
+            # ダウンロード失敗でも全文抽出+FTS自体は続行する(縮退運転)
+            _content_progress.embedder_available = False
+            _content_progress.error_message = (
+                f"埋め込みモデルを利用できないため、全文検索のみ有効にします({e})"
+            )
 
     _content_progress.phase = "indexing"
     _content_progress.current_file = ""
     _content_progress.processed_count = 0
     _content_progress.total_count = 0
+
+    # モデルの実ロード(100MB級で数秒かかる)は、処理対象があると分かってから行う。
+    # スキャン後の自動増分更新は「変更なし」で終わることが大半のため、まず対象を
+    # 数えてから必要な場合だけロードすることで、自動実行の常時コストをほぼゼロにする。
+    model_ready = embedder.is_downloaded(models_root)
+    if not model_ready and not allow_model_download:
+        # 自動実行ではダウンロードを試みない仕様のため、モデル未取得は想定内の
+        # 縮退運転としてエラー表示はしない(手動実行時のみ上のメッセージが出る)
+        _content_progress.embedder_available = False
 
     conn = db.get_connection(db_path)
     try:
@@ -570,7 +591,7 @@ def _run_content_index(db_path: Path, models_root: Path, error_log_path: Optiona
         # 未抽出/更新されたファイルに加え、埋め込みモデルが今回利用可能なら、
         # 過去に縮退運転(モデル未利用)で抽出だけ済ませたファイルも埋め込み対象に含める。
         condition = "(fc.file_id IS NULL OR fc.extracted_at < f.mtime)"
-        if embedder_instance is not None:
+        if model_ready:
             condition = f"({condition} OR (fc.error IS NULL AND fc.embedded_at IS NULL))"
         rows = conn.execute(
             f"""
@@ -581,6 +602,19 @@ def _run_content_index(db_path: Path, models_root: Path, error_log_path: Optiona
             list(extractable),
         ).fetchall()
         _content_progress.total_count = len(rows)
+        if not rows:
+            return
+
+        embedder_instance: Optional[embedder.Embedder] = None
+        if model_ready:
+            try:
+                embedder_instance = embedder.Embedder(models_root)
+            except Exception as e:
+                # onnxruntime/tokenizersが投げうる例外はEmbedderError以外もあり得るため広く捕捉する
+                _content_progress.embedder_available = False
+                _content_progress.error_message = (
+                    f"埋め込みモデルを利用できないため、全文検索のみ有効にします({e})"
+                )
 
         for row in rows:
             if _content_progress.cancel_requested:

@@ -70,6 +70,10 @@ class Phase1Config:
     semantic_min_score: float = 0.75
     semantic_max_results: int = 10
     last_content_index_at: Optional[float] = None
+    # スキャン(差分/全体)完了後にコンテンツインデックスの増分更新を自動実行するか。
+    # 初回(last_content_index_atがNone)は自動実行しない(モデルのダウンロードと
+    # 初回の全ファイル抽出はユーザーが明示的に開始する)。
+    auto_content_index: bool = True
 
 
 @dataclass
