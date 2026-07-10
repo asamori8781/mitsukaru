@@ -10,6 +10,7 @@ from typing import Optional
 import numpy as np
 
 import embedder
+import vector_index
 
 # trigramトークナイザは3文字未満の語句を検索できないため、
 # 短いキーワードはLIKEによる部分一致にフォールバックする。
@@ -234,32 +235,63 @@ def semantic_search(
 
     数十万チャンク規模でもメモリを圧迫しないよう、埋め込みはバッチ単位で
     読み出してスコア計算し、チャンク本文は上位ヒット分だけ後から取得する。
+    IVFインデックス(vector_index)が構築済みならクエリに近い上位クラスタ+
+    未割当(cluster_id NULL)チャンクのみを走査して高速化する。
     戻り値は類似度降順の (file_id, スコア, 最も類似したチャンクの抜粋)。
     """
     # 埋め込みモデルを差し替えた場合など、次元の異なる古いベクトルが残っていると
     # 行列計算が壊れるため、クエリと同じバイト長のものだけを対象にする。
-    cursor = conn.execute(
-        "SELECT fch.id, fch.file_id, fch.embedding FROM file_chunks fch "
-        "JOIN files f ON f.id = fch.file_id "
-        "WHERE f.is_deleted = 0 AND length(fch.embedding) = ?",
-        (int(query_vec.nbytes),),
-    )
+    dim_bytes = int(query_vec.nbytes)
+    queries: list[tuple[str, list]] = []
+    centroids = vector_index.load_centroids(conn, dim=int(query_vec.size))
+    clusters = vector_index.top_clusters(centroids, query_vec) if centroids is not None else None
+    if clusters is not None and len(clusters) < len(centroids):
+        # IVFパス。CROSS JOINで結合順序を固定し、idx_file_chunks_cluster側から
+        # 駆動させる(通常のJOINだとオプティマイザがfiles側から全チャンクを
+        # なめる計画を選び、絞り込みの意味がなくなる)。NULL(未割当)チャンクは
+        # 2本目のクエリで常に走査し、構築後に追加された分の検索漏れを防ぐ。
+        placeholders = ",".join("?" * len(clusters))
+        queries.append((
+            "SELECT fch.id, fch.file_id, fch.embedding FROM file_chunks fch "
+            "CROSS JOIN files f ON f.id = fch.file_id "
+            f"WHERE fch.cluster_id IN ({placeholders}) AND f.is_deleted = 0 "
+            "AND length(fch.embedding) = ?",
+            [*clusters, dim_bytes],
+        ))
+        queries.append((
+            "SELECT fch.id, fch.file_id, fch.embedding FROM file_chunks fch "
+            "CROSS JOIN files f ON f.id = fch.file_id "
+            "WHERE fch.cluster_id IS NULL AND f.is_deleted = 0 "
+            "AND length(fch.embedding) = ?",
+            [dim_bytes],
+        ))
+    else:
+        # インデックス未構築(小規模・構築前・次元不一致)は従来通りの総当たり
+        queries.append((
+            "SELECT fch.id, fch.file_id, fch.embedding FROM file_chunks fch "
+            "JOIN files f ON f.id = fch.file_id "
+            "WHERE f.is_deleted = 0 AND length(fch.embedding) = ?",
+            [dim_bytes],
+        ))
+
     best: dict[int, tuple[float, int]] = {}  # file_id -> (score, chunk_id)
-    while True:
-        rows = cursor.fetchmany(SEMANTIC_SCAN_BATCH)
-        if not rows:
-            break
-        vecs = np.frombuffer(
-            b"".join(row["embedding"] for row in rows), dtype=np.float32
-        ).reshape(len(rows), -1)
-        scores = vecs @ query_vec
-        for row, score in zip(rows, scores):
-            file_id = row["file_id"]
-            if file_id in exclude_ids:
-                continue
-            score = float(score)
-            if score >= min_score and (file_id not in best or score > best[file_id][0]):
-                best[file_id] = (score, row["id"])
+    for sql, params in queries:
+        cursor = conn.execute(sql, params)
+        while True:
+            rows = cursor.fetchmany(SEMANTIC_SCAN_BATCH)
+            if not rows:
+                break
+            vecs = np.frombuffer(
+                b"".join(row["embedding"] for row in rows), dtype=np.float32
+            ).reshape(len(rows), -1)
+            scores = vecs @ query_vec
+            for row, score in zip(rows, scores):
+                file_id = row["file_id"]
+                if file_id in exclude_ids:
+                    continue
+                score = float(score)
+                if score >= min_score and (file_id not in best or score > best[file_id][0]):
+                    best[file_id] = (score, row["id"])
 
     ranked = sorted(best.items(), key=lambda kv: -kv[1][0])[:limit]
     if not ranked:

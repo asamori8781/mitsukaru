@@ -766,6 +766,7 @@ function wireSettingsEvents() {
 const CONTENT_INDEX_PHASE_LABELS = {
   downloading_model: "埋め込みモデルをダウンロード中(初回のみ、数十〜100MB程度)...",
   indexing: "ファイルを処理中...",
+  building_vector_index: "意味検索用インデックスを最適化中(件数が増えた時のみ)...",
 };
 
 let contentIndexPollTimer = null;

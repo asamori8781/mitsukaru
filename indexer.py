@@ -17,6 +17,7 @@ from typing import Callable, Optional
 import db
 import embedder
 import extractor
+import vector_index
 
 BATCH_SIZE = 2000
 
@@ -602,11 +603,9 @@ def _run_content_index(
             list(extractable),
         ).fetchall()
         _content_progress.total_count = len(rows)
-        if not rows:
-            return
 
         embedder_instance: Optional[embedder.Embedder] = None
-        if model_ready:
+        if rows and model_ready:
             try:
                 embedder_instance = embedder.Embedder(models_root)
             except Exception as e:
@@ -615,6 +614,11 @@ def _run_content_index(
                 _content_progress.error_message = (
                     f"埋め込みモデルを利用できないため、全文検索のみ有効にします({e})"
                 )
+
+        # 新規チャンクは(構築済みなら)その場で既存クラスタへ割り当てる。
+        # 未割当のままでも検索漏れはないが、割り当てておくと検索が速いまま保たれ、
+        # 未割当率の増加による再構築の頻度も抑えられる。
+        centroids = vector_index.load_centroids(conn) if embedder_instance is not None else None
 
         for row in rows:
             if _content_progress.cancel_requested:
@@ -653,8 +657,9 @@ def _run_content_index(
                     chunks = _chunk_text(text)
                     try:
                         vecs = embedder_instance.embed_passages(chunks)
+                        cluster_ids = vector_index.assign_clusters(centroids, vecs)
                         chunk_rows = [
-                            (row["id"], i, chunk, embedder.pack_vector(vecs[i]))
+                            (row["id"], i, chunk, embedder.pack_vector(vecs[i]), cluster_ids[i])
                             for i, chunk in enumerate(chunks)
                         ]
                     except Exception as e:
@@ -693,13 +698,32 @@ def _run_content_index(
                 if not needs_reextract:
                     conn.execute("DELETE FROM file_chunks WHERE file_id=?", (row["id"],))
                 conn.executemany(
-                    "INSERT INTO file_chunks(file_id, chunk_index, chunk_text, embedding) "
-                    "VALUES (?, ?, ?, ?)",
+                    "INSERT INTO file_chunks(file_id, chunk_index, chunk_text, embedding, cluster_id) "
+                    "VALUES (?, ?, ?, ?, ?)",
                     chunk_rows,
                 )
                 _content_progress.embedded_count += 1
             conn.commit()
 
             _content_progress.processed_count += 1
+
+        # ループ後(処理0件でも): 意味検索の高速化インデックス(IVF)の構築・再構築。
+        # チャンク数が閾値未満・既存インデックスが十分新しい場合は何もしないため、
+        # 差分スキャン後の自動実行で毎回呼ばれても負荷はほぼない。
+        if not _content_progress.cancel_requested and vector_index.needs_rebuild(conn):
+            _content_progress.phase = "building_vector_index"
+            _content_progress.current_file = ""
+            _content_progress.processed_count = 0
+            _content_progress.total_count = 0
+
+            def _vi_progress(done: int, total: int) -> None:
+                _content_progress.processed_count = done
+                _content_progress.total_count = total
+
+            vector_index.build(
+                conn,
+                cancel_check=lambda: _content_progress.cancel_requested,
+                progress_cb=_vi_progress,
+            )
     finally:
         conn.close()
