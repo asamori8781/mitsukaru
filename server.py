@@ -117,10 +117,34 @@ def _get_embedder() -> Optional[embedder.Embedder]:
 
 # ---- 差分スキャンの自動起動 ----
 
+def _maybe_start_auto_content_index() -> None:
+    """スキャン完了後にコンテンツインデックスの増分更新を自動起動する。
+
+    初回(まだ一度も手動実行していない=last_content_index_atがNone)は起動しない。
+    モデルのダウンロードと初回の全対象ファイル抽出は時間がかかるため、従来通り
+    ユーザーが設定画面から明示的に開始する。2回目以降は変更ファイルのみの差分
+    処理で、変更が無ければモデルロードもせず即終了するため常時実行しても軽い。
+    """
+    cfg = _get_config()
+    if not cfg.phase1.auto_content_index:
+        return
+    if cfg.phase1.last_content_index_at is None:
+        return
+    if indexer.get_progress().get("cancel_requested"):
+        # ユーザーがスキャンを中断した直後に別のバックグラウンド処理を始めない
+        return
+    indexer.start_content_index(
+        config.DB_PATH, config.MODELS_DIR, on_finish=_on_content_index_finished,
+        error_log_path=config.LOGS_DIR / "content_index_errors.jsonl",
+        allow_model_download=False,
+    )
+
+
 def _on_diff_scan_finished(_summary: dict) -> None:
     cfg = _get_config()
     cfg.state.last_diff_scan_at = time.time()
     _save_config(cfg)
+    _maybe_start_auto_content_index()
 
 
 def _on_full_scan_finished(_summary: dict) -> None:
@@ -129,6 +153,7 @@ def _on_full_scan_finished(_summary: dict) -> None:
     cfg.state.last_full_scan_at = now
     cfg.state.last_diff_scan_at = now
     _save_config(cfg)
+    _maybe_start_auto_content_index()
 
 
 def _trigger_startup_diff_scan() -> None:
@@ -214,7 +239,11 @@ def api_test_connection(body: TestConnectionIn) -> dict:
 
 @app.get("/api/settings")
 def api_get_settings() -> dict:
-    return dataclasses.asdict(_get_config().scan)
+    cfg = _get_config()
+    return {
+        **dataclasses.asdict(cfg.scan),
+        "content_index_auto": cfg.phase1.auto_content_index,
+    }
 
 
 @app.post("/api/settings")
@@ -328,6 +357,18 @@ def api_content_index_progress() -> dict:
 @app.post("/api/content-index/cancel")
 def api_content_index_cancel() -> dict:
     indexer.cancel_content_index()
+    return {"ok": True}
+
+
+class ContentIndexAutoIn(BaseModel):
+    enabled: bool
+
+
+@app.post("/api/content-index/auto")
+def api_content_index_auto(body: ContentIndexAutoIn) -> dict:
+    cfg = _get_config()
+    cfg.phase1.auto_content_index = body.enabled
+    _save_config(cfg)
     return {"ok": True}
 
 

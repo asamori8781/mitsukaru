@@ -638,6 +638,7 @@ async function _loadSettingsViewInner() {
   document.getElementById("stats-content-indexed").textContent = stats.content_indexed_count;
   document.getElementById("stats-file-count-2").textContent = stats.file_count;
   document.getElementById("stats-embedded-count").textContent = stats.embedded_file_count;
+  document.getElementById("content-index-auto").checked = scanSettings.content_index_auto;
   document.getElementById("stats-semantic-available").textContent =
     stats.semantic_search_available ? "利用可能" : "未ダウンロード(インデックス作成時に自動取得)";
   document.getElementById("stats-last-content-index").textContent = formatTimestamp(stats.last_content_index_at);
@@ -785,6 +786,18 @@ function wireContentIndexEvents() {
 
   document.getElementById("btn-content-index-cancel").addEventListener("click", async () => {
     await api("/api/content-index/cancel", "POST", {});
+  });
+
+  document.getElementById("content-index-auto").addEventListener("change", async (ev) => {
+    try {
+      await api("/api/content-index/auto", "POST", { enabled: ev.target.checked });
+      showToast(ev.target.checked
+        ? "スキャン後の自動差分更新を有効にしました。"
+        : "スキャン後の自動差分更新を無効にしました。");
+    } catch (e) {
+      ev.target.checked = !ev.target.checked; // 保存に失敗したら表示を元に戻す
+      showToast(e.message);
+    }
   });
 }
 
